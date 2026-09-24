@@ -35,7 +35,7 @@ async def get_delta(
     """Get a specific delta batch by ID."""
     storage = request.app.state.storage
     batch = await storage.get_delta_batch(delta_id)
-    if batch is None:
+    if batch is None or batch.context_id != str(context_id):
         raise HTTPException(status_code=404, detail=f"Delta batch {delta_id} not found")
     return batch.model_dump(mode="json")
 
@@ -49,6 +49,10 @@ async def rollback_delta(
     ctx = await storage.get_context(context_id)
     if ctx is None:
         raise HTTPException(status_code=404, detail=f"Context {context_id} not found")
+
+    batch = await storage.get_delta_batch(delta_id)
+    if batch is None or batch.context_id != str(context_id):
+        raise HTTPException(status_code=404, detail=f"Delta batch {delta_id} not found")
 
     delta_engine = request.app.state.delta_engine
     success = await delta_engine.rollback_batch(delta_id)

@@ -292,75 +292,50 @@ class MaterializationEngine:
         # 10 near-duplicates of the top-scoring bullet.
         ordered_bullets = _mmr_order(bullets, scores, mmr_lambda)
 
-        # Convert top bullets to ConceptNodes for renderer (backward compat with renderers)
-        selected_concepts: list[ConceptNode] = []
-        selected_bullet_ids: list[str] = []
+        # Renderers make the budget decision using the final formatted text.
+        # Keep ID mappings rather than guessing inclusion from content strings:
+        # duplicate facts and schemas can legitimately have identical text.
+        candidates: list[ConceptNode] = []
+        bullet_ids_by_concept: dict[uuid.UUID, str] = {}
+        schema_ids_by_concept: dict[uuid.UUID, str] = {}
         usage_stats: dict[str, str] = {}
-        total_tokens = 0
-
-        intent_budget = 0
-        if intent or core_memory:
-            intent_text = renderer.render([], intent, token_budget, core_memory=core_memory)
-            intent_budget = renderer.estimate_tokens(intent_text)
-
-        # Reserve some headroom for worked examples (rendered at the end).
-        worked_example_budget = 0
-        if worked_examples:
-            wx_text_estimate = sum(
-                renderer.estimate_tokens((ex.get("input") or "") + (ex.get("output") or ""))
-                + 30
-                for ex in worked_examples
+        for schema in schemas[:5]:
+            concept = ConceptNode(
+                type=ConceptType.PATTERN,
+                content=f"[Pattern: {schema.name}] {schema.description}",
+                salience=schema.confidence,
             )
-            worked_example_budget = wx_text_estimate
+            candidates.append(concept)
+            schema_ids_by_concept[concept.id] = schema.id
 
-        remaining = max(0, token_budget - intent_budget - worked_example_budget)
-
-        # Include schema summaries first (token-efficient)
-        schema_ids: list[str] = []
-        if schemas:
-            for schema in schemas[:5]:
-                schema_text = f"[Pattern: {schema.name}] {schema.description}"
-                est = renderer.estimate_tokens(schema_text) + 10
-                if total_tokens + est <= remaining:
-                    selected_concepts.append(ConceptNode(
-                        type=ConceptType.PATTERN,
-                        content=schema_text,
-                        salience=schema.confidence,
-                    ))
-                    total_tokens += est
-                    schema_ids.append(schema.id)
-
-        # Pack bullets into remaining budget
         for bullet in ordered_bullets:
-            est = renderer.estimate_tokens(bullet.content) + 10
-            if total_tokens + est > remaining:
-                break
-            concept_type = self._bullet_type_to_concept_type(
-                bullet.bullet_type.value if hasattr(bullet.bullet_type, 'value') else str(bullet.bullet_type)
-            )
-            selected_concepts.append(ConceptNode(
-                type=concept_type,
+            concept = ConceptNode(
+                type=self._bullet_type_to_concept_type(
+                    bullet.bullet_type.value if hasattr(bullet.bullet_type, "value")
+                    else str(bullet.bullet_type)
+                ),
                 content=bullet.content,
                 salience=bullet.salience,
                 confidence=bullet.confidence,
-            ))
-            selected_bullet_ids.append(bullet.id)
+            )
+            candidates.append(concept)
+            bullet_ids_by_concept[concept.id] = bullet.id
             if include_usage_stats and (bullet.recall_count or bullet.hit_count):
-                # "(used N×, success Y/Z)" surfaces reinforcement signal to the consumer.
-                # Denominator floors at max(recall_count, hit_count) so we never render
-                # "success 3/0" when hit_count was incremented out-of-band from recall.
                 denom = max(bullet.recall_count, bullet.hit_count)
-                usage_stats[bullet.content] = (
+                usage_stats[str(concept.id)] = (
                     f"(used {bullet.recall_count}×, success {bullet.hit_count}/{denom})"
                 )
-            total_tokens += est
 
-        rendered = renderer.render(
-            selected_concepts, intent, token_budget,
+        rendered, selected_concepts = renderer.render_with_selection(
+            candidates, intent, token_budget,
             core_memory=core_memory,
             worked_examples=worked_examples or None,
             usage_stats=usage_stats or None,
         )
+        selected_bullet_ids = [bullet_ids_by_concept[c.id] for c in selected_concepts
+                               if c.id in bullet_ids_by_concept]
+        schema_ids = [schema_ids_by_concept[c.id] for c in selected_concepts
+                      if c.id in schema_ids_by_concept]
         actual_tokens = renderer.estimate_tokens(rendered)
         coverage = len(selected_bullet_ids) / len(bullets) if bullets else 0.0
 
@@ -394,27 +369,10 @@ class MaterializationEngine:
 
         sorted_concepts = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         id_to_concept = {c.id: c for c in concepts}
-        selected: list[ConceptNode] = []
-        total_tokens = 0
-
-        intent_budget = 0
-        if intent or core_memory:
-            intent_text = renderer.render([], intent, token_budget, core_memory=core_memory)
-            intent_budget = renderer.estimate_tokens(intent_text)
-        remaining = token_budget - intent_budget
-
-        for concept_id, score in sorted_concepts:
-            concept = id_to_concept.get(concept_id)
-            if concept is None:
-                continue
-            est = renderer.estimate_tokens(concept.content) + 10
-            if total_tokens + est > remaining:
-                break
-            selected.append(concept)
-            total_tokens += est
-
-        rendered = renderer.render(
-            selected, intent, token_budget,
+        candidates = [id_to_concept[concept_id] for concept_id, _ in sorted_concepts
+                      if concept_id in id_to_concept]
+        rendered, selected = renderer.render_with_selection(
+            candidates, intent, token_budget,
             core_memory=core_memory,
             worked_examples=worked_examples or None,
         )

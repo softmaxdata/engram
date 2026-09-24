@@ -30,6 +30,6 @@ async def get_schema(
     """Get a single schema by ID."""
     storage = request.app.state.storage
     schema = await storage.get_schema(schema_id)
-    if schema is None:
+    if schema is None or schema.context_id != str(context_id):
         raise HTTPException(status_code=404, detail=f"Schema {schema_id} not found")
     return schema.model_dump(mode="json")

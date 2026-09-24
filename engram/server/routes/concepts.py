@@ -93,7 +93,7 @@ async def record_decision(
         raise HTTPException(status_code=404, detail=f"Context {context_id} not found")
 
     ingestion = request.app.state.ingestion
-    concept_id = await ingestion.record_decision(
+    concept_id, _ = await ingestion.record_decision(
         context_id=context_id,
         decision=req.decision,
         rationale=req.rationale,

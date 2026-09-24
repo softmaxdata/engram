@@ -13,13 +13,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 from engram.core.concurrency import ContextLockManager
 from engram.core.config import IngestionConfig
-from engram.core.delta import DeltaEngine
+from engram.core.delta import DeltaEngine, capacity_checked_transaction
 from engram.core.events import EventBus
 from engram.core.exceptions import CapacityExceededError, IngestionError
 from engram.core.models import (
@@ -39,10 +40,20 @@ from engram.core.models import (
     SourceType,
     cap_core_memory,
 )
-from engram.llm.adapter import LLMAdapter
+from engram.core.similarity import validated_cosine_similarity
+from engram.llm.adapter import LLMAdapter, complete_with_model
 from engram.storage.base import StorageBackend
 
 logger = logging.getLogger(__name__)
+
+
+async def _embed_content(llm: LLMAdapter, content: str) -> list[float] | None:
+    """Embed new memory text without making an unavailable provider block writes."""
+    try:
+        return await llm.embed(content)
+    except Exception as exc:
+        logger.warning("Bullet embedding failed: %s", exc)
+        return None
 
 
 def _utcnow() -> datetime:
@@ -160,12 +171,13 @@ class ReflectorEngine:
             f"{context_text}{core_text}{feedback_text}\n\nRaw input:\n{raw_input}"
         )
 
-        raw_response = await self.llm.complete(
+        raw_response = await complete_with_model(
+            self.llm,
+            model=model_override or self.config.reflector_model,
             prompt=prompt,
             system=REFLECTOR_SYSTEM_PROMPT,
             temperature=0.0,
             response_format="json",
-            model=model_override,
         )
 
         try:
@@ -270,6 +282,7 @@ class CuratorEngine:
                 target_id=str(uuid.uuid4())[:8],
                 section="prediction_errors",
                 content=error,
+                embedding=await _embed_content(self.llm, error),
                 bullet_type="exception",
                 reasoning="Prediction error detected by Reflector — high salience signal",
                 source=DeltaSource.REFLECTOR,
@@ -285,6 +298,7 @@ class CuratorEngine:
                 target_id=str(uuid.uuid4())[:8],
                 section="failure_modes",
                 content=failure,
+                embedding=await _embed_content(self.llm, failure),
                 bullet_type="warning",
                 reasoning="Failure mode identified by Reflector",
                 source=DeltaSource.REFLECTOR,
@@ -300,6 +314,7 @@ class CuratorEngine:
                 target_id=str(uuid.uuid4())[:8],
                 section="strategies",
                 content=strategy,
+                embedding=await _embed_content(self.llm, strategy),
                 bullet_type="strategy",
                 reasoning="Successful strategy recorded by Reflector",
                 source=DeltaSource.REFLECTOR,
@@ -430,7 +445,7 @@ class CuratorEngine:
         embedding: list[float] | None = None
         try:
             embedding = await self.llm.embed(insight.content)
-            threshold = 0.85 if is_episodic else 0.92
+            threshold = 0.85 if is_episodic else self.ingestion_config.curator_dedup_threshold
             similar = await self.storage.find_similar_bullets(
                 context_id, embedding, limit=5, threshold=threshold,
             )
@@ -440,6 +455,9 @@ class CuratorEngine:
                     if (b.bullet_type.value if hasattr(b.bullet_type, "value")
                         else str(b.bullet_type)) == "episodic"
                 ]
+            similar = [(bullet, score) for bullet, score in similar
+                       if math.isfinite(score)
+                       and validated_cosine_similarity(embedding, bullet.embedding) is not None]
             if similar:
                 existing_bullet, score = similar[0]
                 # Keep the more specific (longer) phrasing of the two.
@@ -453,6 +471,8 @@ class CuratorEngine:
                     op_type=DeltaOpType.UPDATE_BULLET,
                     target_id=existing_bullet.id,
                     content=merged_content,
+                    embedding=(embedding if merged_content == insight.content
+                               else existing_bullet.embedding),
                     reasoning=f"Merged similar insight into existing bullet (cosine={score:.3f})",
                     source=DeltaSource.CURATOR,
                     confidence=max(existing_bullet.confidence, insight.novelty),
@@ -481,6 +501,7 @@ class CuratorEngine:
                         target_id=str(uuid.uuid4())[:8],
                         section=insight.suggested_section,
                         content=insight.content,
+                        embedding=embedding,
                         bullet_type=insight.insight_type if insight.insight_type in [bt.value for bt in BulletType] else "fact",
                         reasoning=(
                             f"Contradicts existing bullet {existing_bullet.id}: "
@@ -506,6 +527,7 @@ class CuratorEngine:
             target_id=str(uuid.uuid4())[:8],
             section=insight.suggested_section,
             content=insight.content,
+            embedding=embedding,
             bullet_type=bullet_type,
             reasoning=f"New insight (novelty={insight.novelty:.2f}): {insight.evidence[:80]}",
             source=DeltaSource.CURATOR,
@@ -545,14 +567,13 @@ class CuratorEngine:
         1. Find semantically similar bullets (same topic)
         2. Check for negation signals (opposing conclusions)
         """
-        from engram.core.similarity import cosine_similarity as _cosine_similarity
-
         for bullet in existing_bullets:
             if bullet.embedding is None:
                 continue
-            sim = _cosine_similarity(new_embedding, bullet.embedding)
+            sim = validated_cosine_similarity(new_embedding, bullet.embedding)
             # High similarity + negation signal = contradiction
-            if sim >= 0.75 and self._has_negation_signal(new_content, bullet.content):
+            if (sim is not None and sim >= 0.75
+                    and self._has_negation_signal(new_content, bullet.content)):
                 return (bullet, sim)
         return None
 
@@ -573,12 +594,24 @@ class CuratorEngine:
         This is conservative by default — high-value bullets (high salience + hit rate)
         are kept even if the new model doesn't reproduce them.
         """
-        from engram.core.similarity import cosine_similarity as _cosine_similarity
-
         operations: list[DeltaOperation] = []
         matched_old_ids: set[str] = set()
 
+        def valid_vector(vector) -> bool:
+            return validated_cosine_similarity(vector, vector) is not None
+
+        uncertain_old_ids = {
+            bullet.id for bullet in old_bullets if not valid_vector(bullet.embedding)
+        }
+
         for insight in new_reflection.new_insights:
+            # Re-extraction must preserve identity even when an old vector is
+            # missing/corrupt or the embedding provider is unavailable.
+            exact = [bullet for bullet in old_bullets
+                     if bullet.content.strip().casefold() == insight.content.strip().casefold()]
+            if exact:
+                matched_old_ids.update(bullet.id for bullet in exact)
+                continue
             best_match = None
             best_similarity = 0.0
 
@@ -587,16 +620,23 @@ class CuratorEngine:
             except Exception:
                 new_embedding = None
 
-            if new_embedding is not None:
+            if valid_vector(new_embedding):
                 for old_bullet in old_bullets:
                     if old_bullet.id in matched_old_ids:
                         continue
-                    if old_bullet.embedding is None:
+                    if (not valid_vector(old_bullet.embedding)
+                            or len(new_embedding) != len(old_bullet.embedding)):
+                        uncertain_old_ids.add(old_bullet.id)
                         continue
-                    sim = _cosine_similarity(new_embedding, old_bullet.embedding)
+                    sim = validated_cosine_similarity(new_embedding, old_bullet.embedding)
+                    if sim is None:
+                        uncertain_old_ids.add(old_bullet.id)
+                        continue
                     if sim > best_similarity:
                         best_similarity = sim
                         best_match = old_bullet
+            else:
+                uncertain_old_ids.update(bullet.id for bullet in old_bullets)
 
             if best_match and best_similarity > 0.92:
                 # Match found — minor update if content differs meaningfully
@@ -606,6 +646,7 @@ class CuratorEngine:
                         op_type=DeltaOpType.UPDATE_BULLET,
                         target_id=best_match.id,
                         content=insight.content,
+                        embedding=new_embedding,
                         reasoning=(
                             f"Re-extraction improved this bullet "
                             f"(similarity: {best_similarity:.2f})"
@@ -625,6 +666,7 @@ class CuratorEngine:
                     target_id=str(uuid.uuid4())[:8],
                     section=insight.suggested_section,
                     content=insight.content,
+                    embedding=new_embedding,
                     bullet_type=bullet_type,
                     reasoning=(
                         f"New insight discovered by re-extraction "
@@ -635,7 +677,7 @@ class CuratorEngine:
 
         # Old bullets with no match in new extraction — consider removal
         for old_bullet in old_bullets:
-            if old_bullet.id not in matched_old_ids:
+            if old_bullet.id not in matched_old_ids and old_bullet.id not in uncertain_old_ids:
                 # Only remove if the old bullet has low salience and low hit rate
                 # High-value bullets are kept even if re-extraction doesn't reproduce them
                 if old_bullet.effective_salience < 0.3 and old_bullet.hit_rate < 0.3:
@@ -719,6 +761,13 @@ class IngestionEngine:
                     "Duplicate raw input detected (hash=%s), returning existing batch",
                     input_hash[:16],
                 )
+                # Ingestion may have committed before feedback failed. Retry
+                # the idempotent receipt transaction without another extraction.
+                if materialization_id and feedback:
+                    await self._reconsolidate(
+                        materialization_id, feedback, expected_context_id=ctx_id_str,
+                        agent_id=agent_id, session_id=session_id,
+                    )
                 return existing_batch
 
         # Build context summary + load core memory for the Reflector
@@ -759,39 +808,6 @@ class IngestionEngine:
                     session_id=str(session_id) if session_id else None,
                 ))
 
-        # v0.3: Capacity check before applying deltas
-        net_adds = sum(
-            1 for op in batch.operations if op.op_type == DeltaOpType.ADD_BULLET
-        ) - sum(
-            1 for op in batch.operations if op.op_type == DeltaOpType.REMOVE_BULLET
-        )
-        if net_adds > 0:
-            context = await self.storage.get_context(context_id)
-            if context is not None:
-                max_bullets = context.lifecycle_config.max_active_bullets
-                capacity = await self.storage.get_capacity_status(
-                    ctx_id_str, max_bullets
-                )
-                if capacity.pressure_level == "full":
-                    raise CapacityExceededError(
-                        ctx_id_str, capacity.active_bullet_count, max_bullets
-                    )
-
-        # Phase 3: Apply deltas (under lock if available)
-        if self.lock_manager is not None:
-            async with self.lock_manager.acquire(ctx_id_str):
-                self._revalidate_deltas(batch)
-                batch = await self.delta_engine.apply_batch(batch)
-        else:
-            batch = await self.delta_engine.apply_batch(batch)
-
-        # v0.4: Collect bullet IDs produced by ADD_BULLET operations
-        bullet_ids_produced = [
-            op.target_id
-            for op in batch.operations
-            if op.op_type == DeltaOpType.ADD_BULLET and op.target_id
-        ]
-
         # v0.5: embed raw input so future materializations can retrieve it as a
         # DC-style worked example. Best-effort — recall path tolerates absence.
         raw_input_embedding: list[float] | None = None
@@ -800,42 +816,70 @@ class IngestionEngine:
         except Exception as exc:
             logger.warning("Raw-input embedding failed (worked-example retrieval disabled for this commit): %s", exc)
 
-        # Record activity WITH raw input preservation (v0.4) + embedding (v0.5)
-        activity = Activity(
-            agent_id=agent_id,
-            session_id=session_id,
-            action_type=ActionType.FACT_LEARNED,
-            summary=(
-                f"Ingested {content_type.value}: +{batch.bullets_added} bullets, "
-                f"~{batch.bullets_updated} updated, -{batch.bullets_removed} removed, "
-                f"⊕{batch.bullets_merged} merged"
-            ),
-            delta_batch_id=batch.id,
-            # v0.4: Raw input preservation
-            raw_input=content,
-            raw_input_hash=input_hash,
-            content_type=content_type.value,
-            source_agent_model=source_model,
-            feedback=feedback.model_dump() if feedback else None,
-            # v0.4: Extraction metadata
-            extraction_model=self.ingestion_config.reflector_model,
-            extraction_prompt_version=self.ingestion_config.reflector_prompt_version,
-            bullet_ids_produced=bullet_ids_produced,
-            # v0.5: worked-example retrieval
-            raw_input_embedding=raw_input_embedding,
-        )
-        await self.storage.add_activity(context_id, activity)
+        async def persist_commit(batch: DeltaBatch) -> tuple[DeltaBatch, bool]:
+            async with capacity_checked_transaction(self.storage, ctx_id_str) as tx:
+                # Another worker may have committed this input while reflection
+                # ran. Serialize the final hash check with graph + ledger writes.
+                prior = await tx.get_raw_input_by_hash(ctx_id_str, input_hash)
+                if prior is not None and prior.delta_batch_id:
+                    existing = await tx.get_delta_batch(prior.delta_batch_id)
+                    if existing is not None:
+                        return existing, False
+                if self.lock_manager is not None:
+                    self._revalidate_deltas(batch)
+                batch = await DeltaEngine(tx).apply_batch(batch)
+
+                # v0.4: Collect bullet IDs produced by ADD_BULLET operations
+                bullet_ids_produced = [
+                    op.target_id
+                    for op in batch.operations
+                    if op.op_type == DeltaOpType.ADD_BULLET and op.target_id
+                ]
+
+                # Record activity WITH raw input preservation (v0.4) + embedding (v0.5)
+                activity = Activity(
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    action_type=ActionType.FACT_LEARNED,
+                    summary=(
+                        f"Ingested {content_type.value}: +{batch.bullets_added} bullets, "
+                        f"~{batch.bullets_updated} updated, -{batch.bullets_removed} removed, "
+                        f"⊕{batch.bullets_merged} merged"
+                    ),
+                    delta_batch_id=batch.id,
+                    # v0.4: Raw input preservation
+                    raw_input=content,
+                    raw_input_hash=input_hash,
+                    content_type=content_type.value,
+                    source_agent_model=source_model,
+                    feedback=feedback.model_dump() if feedback else None,
+                    # v0.4: Extraction metadata
+                    extraction_model=self.ingestion_config.reflector_model,
+                    extraction_prompt_version=self.ingestion_config.reflector_prompt_version,
+                    bullet_ids_produced=bullet_ids_produced,
+                    # v0.5: worked-example retrieval
+                    raw_input_embedding=raw_input_embedding,
+                )
+                await tx.add_activity(context_id, activity)
+                return batch, True
+
+        if self.lock_manager is not None:
+            async with self.lock_manager.acquire(ctx_id_str):
+                batch, persisted = await persist_commit(batch)
+        else:
+            batch, persisted = await persist_commit(batch)
 
         # Reconsolidation: if this commit references a materialization, update
         # bullet stats via a delta batch (audit-clean, rollback-able).
         if materialization_id and feedback:
             await self._reconsolidate(
                 materialization_id, feedback,
+                expected_context_id=ctx_id_str,
                 agent_id=agent_id, session_id=session_id,
             )
 
         # v0.3: Emit event
-        if self.event_bus is not None:
+        if persisted and self.event_bus is not None:
             self.event_bus.emit(
                 ctx_id_str,
                 event_type="commit",
@@ -863,14 +907,15 @@ class IngestionEngine:
         session_id: str | None = None,
     ) -> tuple[Bullet, DeltaBatch]:
         """Add a single bullet directly (bypass Reflector)."""
-        # v0.3: Capacity check
+        # Preserve the cheap full-context rejection before a provider call;
+        # the transaction below rechecks actual rows to close the race.
         context = await self.storage.get_context(uuid.UUID(context_id))
         if context is not None:
             max_bullets = context.lifecycle_config.max_active_bullets
             capacity = await self.storage.get_capacity_status(context_id, max_bullets)
             if capacity.pressure_level == "full":
                 raise CapacityExceededError(
-                    context_id, capacity.active_bullet_count, max_bullets
+                    context_id, capacity.active_bullet_count, max_bullets,
                 )
 
         bullet_id = str(uuid.uuid4())[:8]
@@ -879,6 +924,7 @@ class IngestionEngine:
             target_id=bullet_id,
             section=section,
             content=content,
+            embedding=await _embed_content(self.llm, content),
             bullet_type=bullet_type.value,
             reasoning="Direct bullet addition (bypass Reflector)",
             source=DeltaSource.USER,
@@ -892,21 +938,20 @@ class IngestionEngine:
             trigger="direct_add",
         )
 
-        # v0.3: Apply under lock if available
+        async def persist_add():
+            async with capacity_checked_transaction(self.storage, context_id) as tx:
+                applied = await DeltaEngine(tx).apply_batch(batch)
+                bullet = await tx.get_bullet(bullet_id)
+                if bullet is not None:
+                    bullet.salience = salience
+                    await tx.update_bullet(bullet)
+                return bullet, applied
+
         if self.lock_manager is not None:
             async with self.lock_manager.acquire(context_id):
-                batch = await self.delta_engine.apply_batch(batch)
+                bullet, batch = await persist_add()
         else:
-            batch = await self.delta_engine.apply_batch(batch)
-
-        bullet = await self.storage.get_bullet(bullet_id)
-        if bullet:
-            bullet.salience = salience
-            try:
-                bullet.embedding = await self.llm.embed(content)
-            except Exception:
-                pass
-            await self.storage.update_bullet(bullet)
+            bullet, batch = await persist_add()
 
         # v0.3: Emit event
         if self.event_bus is not None:
@@ -939,6 +984,7 @@ class IngestionEngine:
             target_id=decision_id,
             section="decisions",
             content=f"{decision}. Rationale: {rationale}",
+            embedding=await _embed_content(self.llm, f"{decision}. Rationale: {rationale}"),
             bullet_type="decision",
             reasoning=f"Decision recorded: {decision}",
             source=DeltaSource.USER,
@@ -953,6 +999,7 @@ class IngestionEngine:
                 target_id=str(uuid.uuid4())[:8],
                 section="decisions",
                 content=f"Alternative considered: {alt}",
+                embedding=await _embed_content(self.llm, f"Alternative considered: {alt}"),
                 bullet_type="fact",
                 reasoning=f"Alternative for decision: {decision}",
                 source=DeltaSource.USER,
@@ -966,109 +1013,73 @@ class IngestionEngine:
             operations=operations,
             trigger="decision",
         )
-        batch = await self.delta_engine.apply_batch(batch)
+        async with capacity_checked_transaction(self.storage, ctx_id_str) as tx:
+            batch = await DeltaEngine(tx).apply_batch(batch)
 
-        activity = Activity(
-            agent_id=agent_id,
-            session_id=session_id,
-            action_type=ActionType.DECISION_MADE,
-            summary=f"Decision: {decision}",
-            delta_batch_id=batch.id,
-        )
-        await self.storage.add_activity(context_id, activity)
-
+            activity = Activity(
+                agent_id=agent_id,
+                session_id=session_id,
+                action_type=ActionType.DECISION_MADE,
+                summary=f"Decision: {decision}",
+                delta_batch_id=batch.id,
+            )
+            await tx.add_activity(context_id, activity)
         return decision_id, batch
 
     async def _reconsolidate(
         self, materialization_id: str, feedback: ExecutionFeedback,
         agent_id: str | None = None, session_id: uuid.UUID | None = None,
+        expected_context_id: str | None = None,
     ) -> DeltaBatch | None:
-        """Post-recall reconsolidation, routed through the DeltaEngine.
-
-        Emits one RECONSOLIDATE_BULLET op per bullet in the recall, applied as
-        a single batch so the audit trail / rollback story is consistent with
-        every other mutation. (README claim: "all mutations through deltas.")
-        """
+        """Consume feedback and its delta audit atomically across workers."""
         record = await self.storage.get_materialization(materialization_id)
         if record is None:
-            logger.warning("Materialization %s not found for reconsolidation", materialization_id)
             return None
-
-        # Idempotency: a materialization may be reconsolidated exactly once.
-        # Without this, a replayed materialization_id (retry, at-least-once
-        # delivery, or two commits citing one recall) double-counts hits and
-        # compounds salience.
-        if record.reconsolidated_at is not None:
-            logger.info(
-                "Materialization %s already reconsolidated at %s; skipping replay",
-                materialization_id, record.reconsolidated_at,
-            )
+        if expected_context_id is not None and record.context_id != expected_context_id:
             return None
-
-        # Decide the per-bullet effect from the outcome once.
-        if feedback.outcome == FeedbackOutcome.SUCCESS:
-            recall_delta, hit_delta, miss_delta, mult = 1, 1, 0, 1.05
-        elif feedback.outcome == FeedbackOutcome.FAILURE:
-            recall_delta, hit_delta, miss_delta, mult = 1, 0, 1, 0.95
-        else:
-            recall_delta, hit_delta, miss_delta, mult = 1, 0, 0, 1.00
-
-        ops: list[DeltaOperation] = []
-        for bullet_id in record.bullets_included:
-            ops.append(DeltaOperation(
-                op_type=DeltaOpType.RECONSOLIDATE_BULLET,
-                target_id=bullet_id,
-                reasoning=(
-                    f"Reconsolidation from materialization {materialization_id} "
-                    f"(outcome={feedback.outcome.value})"
-                ),
-                source=DeltaSource.REFLECTOR,
-                confidence=0.9,
-                agent_id=agent_id,
-                session_id=str(session_id) if session_id else None,
-                # previous_state carries the *input* deltas; DeltaEngine swaps
-                # it for a rollback snapshot after applying.
-                previous_state={
-                    "recall_delta": recall_delta,
-                    "hit_delta": hit_delta,
-                    "miss_delta": miss_delta,
-                    "salience_multiplier": mult,
-                    "outcome": feedback.outcome.value,
-                },
-            ))
-        if not ops:
-            return None
-
-        batch = DeltaBatch(
-            context_id=record.context_id,
-            operations=ops,
-            trigger="reconsolidation",
-        )
-        if self.lock_manager is not None:
-            async with self.lock_manager.acquire(record.context_id):
-                # Re-check under the lock so two concurrent replays can't both
-                # pass the pre-lock idempotency guard and double-apply.
-                fresh = await self.storage.get_materialization(materialization_id)
-                if fresh is not None and fresh.reconsolidated_at is not None:
-                    logger.info(
-                        "Materialization %s reconsolidated concurrently; skipping",
-                        materialization_id,
-                    )
-                    return None
-                batch = await self.delta_engine.apply_batch(batch)
-                await self.storage.mark_materialization_reconsolidated(
-                    materialization_id, _utcnow(),
-                )
-        else:
-            batch = await self.delta_engine.apply_batch(batch)
-            await self.storage.mark_materialization_reconsolidated(
-                materialization_id, _utcnow(),
-            )
-
-        logger.info(
-            "Reconsolidation: %d bullets updated from materialization %s (outcome=%s)",
-            len(ops), materialization_id, feedback.outcome.value,
-        )
+        async with self.storage.transaction(record.context_id) as tx:
+            fresh = await tx.get_materialization(materialization_id)
+            if (
+                fresh is None or fresh.context_id != record.context_id
+                or fresh.reconsolidated_at is not None
+                or (expected_context_id is not None and fresh.context_id != expected_context_id)
+            ):
+                return None
+            if feedback.outcome == FeedbackOutcome.SUCCESS:
+                recall_delta, hit_delta, miss_delta, mult = 1, 1, 0, 1.05
+            elif feedback.outcome == FeedbackOutcome.FAILURE:
+                recall_delta, hit_delta, miss_delta, mult = 1, 0, 1, 0.95
+            else:
+                recall_delta, hit_delta, miss_delta, mult = 1, 0, 0, 1.00
+            operations = []
+            for bullet_id in sorted(set(fresh.bullets_included)):
+                bullet = await tx.get_bullet(bullet_id)
+                if (
+                    bullet is None or bullet.context_id != fresh.context_id
+                    or not bullet.is_active or bullet.is_archived
+                    or bullet.lifecycle_state.value != "active"
+                ):
+                    continue
+                operations.append(DeltaOperation(
+                    op_type=DeltaOpType.RECONSOLIDATE_BULLET,
+                    target_id=bullet_id,
+                    reasoning=f"Reconsolidation from materialization {materialization_id}",
+                    source=DeltaSource.REFLECTOR,
+                    confidence=0.9,
+                    agent_id=agent_id,
+                    session_id=str(session_id) if session_id else None,
+                    previous_state={
+                        "recall_delta": recall_delta, "hit_delta": hit_delta,
+                        "miss_delta": miss_delta, "salience_multiplier": mult,
+                        "outcome": feedback.outcome.value,
+                    },
+                ))
+            batch = None
+            if operations:
+                batch = await DeltaEngine(tx).apply_batch(DeltaBatch(
+                    context_id=fresh.context_id, operations=operations, trigger="reconsolidation",
+                ))
+            await tx.mark_materialization_reconsolidated(materialization_id, _utcnow())
         return batch
 
     @staticmethod

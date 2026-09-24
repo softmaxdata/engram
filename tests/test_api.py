@@ -5,12 +5,35 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
-from engram.server.app import create_app
+from engram.core.config import Settings
+from engram.server import app as app_module
+from engram.storage.sqlite import SQLiteBackend
+
+
+class OfflineLLM:
+    """API tests must never call a provider or use developer credentials."""
+
+    async def embed(self, text):
+        import hashlib
+
+        digest = hashlib.sha256(text.encode()).digest()
+        return [value / 255.0 for value in digest]
+
+    async def complete(self, *args, **kwargs):
+        raise AssertionError("Unexpected LLM completion in API test")
 
 
 @pytest.fixture
-def app():
-    return create_app()
+def app(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        app_module, "_create_storage",
+        lambda: SQLiteBackend(str(tmp_path / "api-test.db")),
+    )
+    monkeypatch.setattr(app_module, "_create_llm", OfflineLLM)
+    settings = Settings(_env_file=None)
+    monkeypatch.setattr(app_module, "get_settings", lambda: settings)
+    monkeypatch.setattr("engram.core.config.get_settings", lambda: settings)
+    return app_module.create_app()
 
 
 @pytest.fixture

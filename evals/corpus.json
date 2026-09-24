@@ -1,0 +1,451 @@
+{
+  "version": 1,
+  "benchmark": "controlled_regression",
+  "description": "Curated judgments and synthetic vectors; not measured real-provider retrieval quality.",
+  "renderers": [
+    "claude",
+    "gpt",
+    "generic"
+  ],
+  "cases": [
+    {
+      "id": "semantic_over_salience",
+      "query": "How do we retry a throttled request?",
+      "query_vector": [
+        1,
+        0,
+        0
+      ],
+      "items": [
+        {
+          "id": "retry",
+          "text": "Retry throttled requests with exponential backoff.",
+          "vector": [
+            1,
+            0,
+            0
+          ],
+          "salience": 0.1
+        },
+        {
+          "id": "office",
+          "text": "The office kitchen stocks coffee beans.",
+          "vector": [
+            0,
+            1,
+            0
+          ],
+          "salience": 1
+        }
+      ],
+      "relevance": {
+        "retry": 3
+      },
+      "k": 1,
+      "token_budget": 500,
+      "thresholds": {
+        "recall_at_k": 1,
+        "ndcg_at_k": 1
+      }
+    },
+    {
+      "id": "irrelevant_distractors",
+      "query": "How are API credentials stored and rotated?",
+      "query_vector": [
+        1,
+        0,
+        0
+      ],
+      "items": [
+        {
+          "id": "store",
+          "text": "Store API credentials in the secret manager.",
+          "vector": [
+            1,
+            0,
+            0
+          ],
+          "salience": 0.5
+        },
+        {
+          "id": "rotate",
+          "text": "Rotate API credentials every thirty days.",
+          "vector": [
+            0.95,
+            0.312,
+            0
+          ],
+          "salience": 0.5
+        },
+        {
+          "id": "lunch",
+          "text": "Lunch is served at noon.",
+          "vector": [
+            0,
+            1,
+            0
+          ],
+          "salience": 1
+        },
+        {
+          "id": "colors",
+          "text": "The landing page uses a blue background.",
+          "vector": [
+            0,
+            0,
+            1
+          ],
+          "salience": 1
+        }
+      ],
+      "relevance": {
+        "store": 3,
+        "rotate": 2
+      },
+      "k": 2,
+      "token_budget": 500,
+      "thresholds": {
+        "recall_at_k": 1,
+        "ndcg_at_k": 1
+      }
+    },
+    {
+      "id": "duplicate_and_diverse",
+      "query": "How do we make releases recoverable?",
+      "query_vector": [
+        1,
+        0,
+        0
+      ],
+      "items": [
+        {
+          "id": "canary",
+          "text": "Deploy a canary before the full rollout.",
+          "vector": [
+            1,
+            0,
+            0
+          ],
+          "salience": 0.5
+        },
+        {
+          "id": "duplicate",
+          "text": "Run a canary release before broad deployment.",
+          "vector": [
+            0.999,
+            0.0447,
+            0
+          ],
+          "salience": 0.5
+        },
+        {
+          "id": "rollback",
+          "text": "Retain the prior image for immediate rollback.",
+          "vector": [
+            0.8,
+            0,
+            0.6
+          ],
+          "salience": 0.5
+        }
+      ],
+      "relevance": {
+        "canary": 3,
+        "duplicate": 1,
+        "rollback": 2
+      },
+      "k": 3,
+      "token_budget": 500,
+      "thresholds": {
+        "recall_at_k": 1,
+        "ndcg_at_k": 0.9
+      }
+    },
+    {
+      "id": "lifecycle_exclusion",
+      "query": "Which support escalation policy is current?",
+      "query_vector": [
+        1,
+        0,
+        0
+      ],
+      "items": [
+        {
+          "id": "current",
+          "text": "Current support escalations go to the on-call lead.",
+          "vector": [
+            0.9,
+            0.436,
+            0
+          ],
+          "salience": 0.5
+        },
+        {
+          "id": "archived",
+          "text": "Archived escalations go to the former manager.",
+          "vector": [
+            1,
+            0,
+            0
+          ],
+          "salience": 0.5,
+          "is_archived": true
+        },
+        {
+          "id": "inactive",
+          "text": "Inactive escalations go to the retired queue.",
+          "vector": [
+            1,
+            0,
+            0
+          ],
+          "salience": 0.5,
+          "is_active": false
+        }
+      ],
+      "relevance": {
+        "current": 3
+      },
+      "k": 1,
+      "token_budget": 500,
+      "thresholds": {
+        "recall_at_k": 1,
+        "ndcg_at_k": 1
+      },
+      "forbidden_ids": [
+        "archived",
+        "inactive"
+      ]
+    },
+    {
+      "id": "tenant_isolation",
+      "query": "Where is this project deployed?",
+      "query_vector": [
+        1,
+        0,
+        0
+      ],
+      "items": [
+        {
+          "id": "local",
+          "text": "This project deploys in the west region.",
+          "vector": [
+            0.9,
+            0.436,
+            0
+          ],
+          "salience": 0.5
+        },
+        {
+          "id": "foreign",
+          "text": "Another tenant deploys in the secret east region.",
+          "vector": [
+            1,
+            0,
+            0
+          ],
+          "salience": 0.5,
+          "foreign": true
+        }
+      ],
+      "relevance": {
+        "local": 3
+      },
+      "k": 1,
+      "token_budget": 500,
+      "thresholds": {
+        "recall_at_k": 1,
+        "ndcg_at_k": 1
+      },
+      "forbidden_ids": [
+        "foreign"
+      ]
+    },
+    {
+      "id": "oversized_candidate",
+      "query": "What is the safe fallback during an outage?",
+      "query_vector": [
+        1,
+        0,
+        0
+      ],
+      "items": [
+        {
+          "id": "oversized",
+          "text": "Historical outage log: Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. Repeated diagnostic details. ",
+          "vector": [
+            1,
+            0,
+            0
+          ],
+          "salience": 0.5
+        },
+        {
+          "id": "fallback",
+          "text": "Fallback to the read-only replica.",
+          "vector": [
+            0.9,
+            0.436,
+            0
+          ],
+          "salience": 0.5
+        }
+      ],
+      "relevance": {
+        "fallback": 3
+      },
+      "k": 1,
+      "token_budget": 70,
+      "thresholds": {
+        "recall_at_k": 1,
+        "ndcg_at_k": 1
+      }
+    },
+    {
+      "id": "tight_budget_receipt",
+      "query": "How should we release the service?",
+      "query_vector": [
+        1,
+        0,
+        0
+      ],
+      "items": [
+        {
+          "id": "first",
+          "text": "Use canary releases.",
+          "vector": [
+            1,
+            0,
+            0
+          ],
+          "salience": 0.5
+        },
+        {
+          "id": "second",
+          "text": "Monitor error rates.",
+          "vector": [
+            0.9,
+            0.436,
+            0
+          ],
+          "salience": 0.5
+        },
+        {
+          "id": "third",
+          "text": "Keep rollback ready.",
+          "vector": [
+            0.8,
+            0,
+            0.6
+          ],
+          "salience": 0.5
+        }
+      ],
+      "relevance": {
+        "first": 3
+      },
+      "k": 1,
+      "token_budget": 45,
+      "thresholds": {
+        "recall_at_k": 1,
+        "ndcg_at_k": 1
+      }
+    },
+    {
+      "id": "empty_context",
+      "query": "What facts have been recorded?",
+      "query_vector": [
+        1,
+        0,
+        0
+      ],
+      "items": [],
+      "relevance": {},
+      "k": 1,
+      "token_budget": 500,
+      "thresholds": {
+        "recall_at_k": 1,
+        "ndcg_at_k": 1
+      },
+      "expect_empty": true
+    },
+    {
+      "id": "legacy_oversized",
+      "query": "What is the database recovery action?",
+      "query_vector": [
+        1,
+        0,
+        0
+      ],
+      "items": [
+        {
+          "id": "legacy_large",
+          "text": "Old recovery log: Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. Diagnostic detail. ",
+          "vector": [
+            1,
+            0,
+            0
+          ],
+          "salience": 0.5
+        },
+        {
+          "id": "legacy_small",
+          "text": "Restore the verified backup.",
+          "vector": [
+            0.9,
+            0.436,
+            0
+          ],
+          "salience": 0.5
+        }
+      ],
+      "relevance": {
+        "legacy_small": 3
+      },
+      "k": 1,
+      "token_budget": 70,
+      "thresholds": {
+        "recall_at_k": 1,
+        "ndcg_at_k": 1
+      },
+      "kind": "legacy"
+    },
+    {
+      "id": "schema_summary",
+      "query": "What is our reliability pattern?",
+      "query_vector": [
+        1,
+        0,
+        0
+      ],
+      "items": [
+        {
+          "id": "schema_fact",
+          "text": "Verify the failover before declaring recovery.",
+          "vector": [
+            1,
+            0,
+            0
+          ],
+          "salience": 0.5
+        }
+      ],
+      "relevance": {
+        "schema_fact": 3
+      },
+      "k": 1,
+      "token_budget": 500,
+      "thresholds": {
+        "recall_at_k": 1,
+        "ndcg_at_k": 1
+      },
+      "schemas": [
+        {
+          "id": "recovery_pattern",
+          "name": "Recovery",
+          "description": "Fail over, verify, and report recovery."
+        }
+      ]
+    }
+  ]
+}
