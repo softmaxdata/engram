@@ -1,29 +1,14 @@
-"""MCP (Model Context Protocol) server for Claude integration.
+"""MCP tools for Claude and other Model Context Protocol clients.
 
-v0.2: Added save_bullet, list_bullets, consolidate, get_health tools.
-Updated save_context to show bullet-based results.
-v0.4: Added re_extract_context and get_ingestion_config tools.
-v0.4.1: Added engram_ prefixed tool names per app.engram.so spec.
+Run with an absolute virtualenv Python path:
+    /absolute/path/to/engram/.venv/bin/python -m engram.integrations.mcp_server
 
-Run locally:   python -m engram.integrations.mcp_server
-Run hosted:    Served at mcp.engram.so for cloud customers
+The stdio bridge reads ENGRAM_API_URL (default http://localhost:5820) and
+ENGRAM_API_KEY (optional for self-hosted OSS, required for Engram Cloud).
+Install from this corrected checkout as documented in the README. The published
+engram-contextdb 0.4.5 wheel does not yet include the stdio entrypoint fix.
 
-Add to Claude:
-  claude mcp add engram -- python -m engram.integrations.mcp_server
-
-Or configure in claude_desktop_config.json:
-  {
-    "mcpServers": {
-      "engram": {
-        "command": "python",
-        "args": ["-m", "engram.integrations.mcp_server"],
-        "env": {
-          "ENGRAM_API_URL": "http://localhost:5820",
-          "ENGRAM_API_KEY": "eng_sk_..."
-        }
-      }
-    }
-  }
+Cloud custom connector URL: https://api.engram.so/mcp/sse
 """
 
 from __future__ import annotations
@@ -31,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from typing import Any
 
@@ -47,20 +33,30 @@ except ImportError:
     MCP_AVAILABLE = False
 
 
-def create_mcp_server(engram_url: str = "http://localhost:5820") -> Any:
-    """Create an MCP server that exposes Engram operations as tools for Claude.
+def create_mcp_server(
+    engram_url: str = "http://localhost:5820",
+    client: Any = None,
+) -> Any:
+    """Expose Engram operations as MCP tools.
 
-    Requires the `mcp` extra: pip install engram[mcp]
+    ``client`` may be an authenticated SDK client supplied by a hosted transport;
+    its lifetime remains the caller's responsibility. Otherwise, ``engram_url``
+    is used to construct a client. The stdio runner supplies and closes its own
+    client, including its configured API key.
+
+    Install MCP support from the checkout: python -m pip install ".[mcp]"
     """
     if not MCP_AVAILABLE:
         raise ImportError(
-            "MCP SDK not installed. Install with: pip install engram[mcp]"
+            "MCP SDK not installed. Install from the source checkout with: "
+            'python -m pip install ".[mcp]"'
         )
 
     from engram.sdk.client import Engram
 
     server = Server("engram")
-    client = Engram(url=engram_url)
+    if client is None:
+        client = Engram(url=engram_url)
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
@@ -527,7 +523,7 @@ def create_mcp_server(engram_url: str = "http://localhost:5820") -> Any:
                     return [
                         TextContent(
                             type="text",
-                            text=f"Decision recorded. Bullet ID: {result.get('decision_id', 'N/A')}",
+                            text=f"Decision recorded. Bullet ID: {result.get('concept_id', 'N/A')}",
                         )
                     ]
 
@@ -689,7 +685,7 @@ def create_mcp_server(engram_url: str = "http://localhost:5820") -> Any:
                     return [
                         TextContent(
                             type="text",
-                            text=f"Decision recorded (id: {result.get('decision_id', 'unknown')})",
+                            text=f"Decision recorded (id: {result.get('concept_id', 'unknown')})",
                         )
                     ]
 
@@ -736,12 +732,25 @@ def create_mcp_server(engram_url: str = "http://localhost:5820") -> Any:
 
 
 async def run_mcp_server(engram_url: str = "http://localhost:5820") -> None:
-    """Run the MCP server over stdio."""
+    """Run the stdio bridge, honoring ENGRAM_API_URL and ENGRAM_API_KEY."""
     if not MCP_AVAILABLE:
         raise ImportError(
-            "MCP SDK not installed. Install with: pip install engram[mcp]"
+            "MCP SDK not installed. Install from the source checkout with: "
+            'python -m pip install ".[mcp]"'
         )
 
-    server = create_mcp_server(engram_url)
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+    from engram.sdk.client import Engram
+
+    url = os.environ.get("ENGRAM_API_URL", engram_url)
+    api_key = os.environ.get("ENGRAM_API_KEY")
+    client = Engram(url=url, api_key=api_key)
+    try:
+        server = create_mcp_server(client=client)
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, server.create_initialization_options())
+    finally:
+        await client.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(run_mcp_server())

@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "engram"
+name = "engram-contextdb"
 version = "0.5.0"
 description = "A brain-inspired, portable context database for AI agents"
 readme = "README.md"
@@ -48,7 +48,7 @@ dev = [
     "mypy>=1.13.0",
 ]
 mcp = [
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2.0.0",
 ]
 
 [project.scripts]
@@ -68,3 +68,6 @@ select = ["E", "F", "I", "N", "W", "UP"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["engram"]

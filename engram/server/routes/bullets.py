@@ -82,7 +82,7 @@ async def get_bullet(
     """Get a single bullet by ID."""
     storage = request.app.state.storage
     bullet = await storage.get_bullet(bullet_id)
-    if bullet is None:
+    if bullet is None or bullet.context_id != str(context_id):
         raise HTTPException(status_code=404, detail=f"Bullet {bullet_id} not found")
 
     data = bullet.model_dump(mode="json")
