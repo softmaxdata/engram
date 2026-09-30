@@ -18,20 +18,6 @@ class GPTRenderer(ContextRenderer):
         worked_examples: list[dict] | None = None,
         usage_stats: dict[str, str] | None = None,
     ) -> str:
-        return self.render_with_selection(
-            concepts, intent, token_budget,
-            core_memory=core_memory, worked_examples=worked_examples, usage_stats=usage_stats,
-        )[0]
-
-    def _render_full(
-        self,
-        concepts: list[ConceptNode],
-        intent: IntentAnchor | None,
-        token_budget: int,
-        core_memory: str = "",
-        worked_examples: list[dict] | None = None,
-        usage_stats: dict[str, str] | None = None,
-    ) -> str:
         sections: list[str] = []
 
         if core_memory:
@@ -64,18 +50,26 @@ class GPTRenderer(ContextRenderer):
         ]
 
         categorized_types = {ct for _, ct in groups}
+        current_tokens = self.estimate_tokens("\n".join(sections))
+
         for heading, concept_type in groups:
             items = [c for c in concepts if c.type == concept_type]
             if not items:
                 continue
             block = self._render_group(heading, items, usage_stats)
+            block_tokens = self.estimate_tokens(block)
+            if current_tokens + block_tokens > token_budget:
+                break
             sections.append(block)
+            current_tokens += block_tokens
 
         # Remaining types
         other = [c for c in concepts if c.type not in categorized_types]
         if other:
             block = self._render_group("Other Context", other, usage_stats)
-            sections.append(block)
+            block_tokens = self.estimate_tokens(block)
+            if current_tokens + block_tokens <= token_budget:
+                sections.append(block)
 
         if worked_examples:
             sections.append("\n## Worked Examples\n")
@@ -103,7 +97,7 @@ class GPTRenderer(ContextRenderer):
             enc = tiktoken.encoding_for_model("gpt-4o")
             return len(enc.encode(text))
         except Exception:
-            return len(text) // 4 + 1 if text else 0
+            return len(text) // 4 + 1
 
     def _render_group(
         self, heading: str, concepts: list[ConceptNode],
@@ -112,6 +106,6 @@ class GPTRenderer(ContextRenderer):
         lines = [f"\n## {heading}\n"]
         for c in concepts:
             tag_str = f" `{', '.join(c.domain_tags)}`" if c.domain_tags else ""
-            usage = self._usage_suffix(c, usage_stats)
+            usage = f" {usage_stats[c.content]}" if usage_stats and c.content in usage_stats else ""
             lines.append(f"- {c.content}{tag_str}{usage}")
         return "\n".join(lines)

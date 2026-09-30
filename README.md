@@ -91,9 +91,11 @@ There are two storage options:
 - SQLite (local) — zero setup, tables auto-created on first run
 - PostgreSQL (local/remote) — requires creating the database first
 
-For PostgreSQL, install pgvector on the database server and create the database first:
+For PostgreSQL, create the database and enable pgvector before starting the server:
 ```sql
 CREATE DATABASE engram;
+\c engram
+CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
 Then set the environment variables:
@@ -102,14 +104,7 @@ ENGRAM_STORAGE_BACKEND=postgres
 ENGRAM_POSTGRES_DSN=postgresql://user:password@host:5432/engram
 ```
 
-Engram enables the `vector` extension before opening its connection pool and creates
-tables on first startup. The Docker Compose pgvector image already includes the
-extension files, so `docker compose up` works with a fresh volume.
-
-On managed PostgreSQL, an administrator may need to run
-`CREATE EXTENSION IF NOT EXISTS vector` in the Engram database before the first
-startup if the application role cannot install extensions. Existing extensions and
-data are preserved across restarts; do not delete your database volume to upgrade.
+All tables are auto-created on first server start for both backends.
 
 ### 1. Configure the Server
 
@@ -154,11 +149,15 @@ ENGRAM_CURATOR_SLOW_PATH_MODEL=claude-haiku-4-5  # For complex conflicts
 # ─── Embedding ──────────────────────────────────────────────
 ENGRAM_EMBEDDING_MODEL=text-embedding-3-small
 
-# Consolidation is invoked through the SDK or REST API.
-# This server does not schedule consolidation from environment variables.
+# ─── Consolidation ──────────────────────────────────────────
+ENGRAM_CONSOLIDATION_TRIGGER=every_10_commits  # or "daily", "manual"
+ENGRAM_FAST_DECAY_RATE=0.97            # Per-day salience decay for normal bullets
+ENGRAM_SLOW_DECAY_RATE=0.995           # Per-day decay for decisions/schemas (slower)
 
-# The OSS server has no built-in account authentication.
-# Cloud account/API-key authentication belongs to the hosted edition.
+# ─── Auth (disabled for local dev, enable for production) ───
+ENGRAM_AUTH_ENABLED=false
+# COGNITO_USER_POOL_ID=us-west-2_xxx
+# COGNITO_APP_CLIENT_ID=xxx
 ```
 
 ### 2. Start the Server
@@ -770,59 +769,33 @@ Capacity management with pressure levels:
 
 ### MCP Server (Claude)
 
-For **Engram Cloud**, add `https://api.engram.so/mcp/sse` in Claude's
-**Settings → Connectors → Add custom connector**, then sign in to Engram and
-authorize access. See [Cloud setup](https://app.engram.so/setup).
-
-For a **local stdio bridge**, install from a checkout containing this fix using
-Python 3.11 or later. The published `engram-contextdb` 0.4.5 wheel lacks the
-module entrypoint; use the corrected source checkout until a fixed release is
-available. The distribution is `engram-contextdb`; imports remain `engram`.
-
 ```bash
-cd /absolute/path/to/engram
-python3 -m venv .venv
-.venv/bin/python -m pip install ".[mcp]"
+pip install engram[mcp]
+python -m engram.integrations.mcp_server
 ```
 
-Start your self-hosted Engram HTTP server separately as described in Quick Start.
-The MCP process connects to that server; it does not start the database API.
-
-Configure Claude Code with the absolute path to the installed interpreter:
-
+Configure in Claude Code:
 ```bash
-claude mcp add --transport stdio \
-  --env ENGRAM_API_URL=http://localhost:5820 \
-  engram -- /absolute/path/to/engram/.venv/bin/python -m engram.integrations.mcp_server
+claude mcp add engram -- python -m engram.integrations.mcp_server
 ```
 
-For Claude Desktop, open **Settings → Developer → Edit Config** and merge the
-`engram` entry into the existing `mcpServers` object. Keep one JSON root object:
-
+Or in `claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
     "engram": {
-      "command": "/absolute/path/to/engram/.venv/bin/python",
+      "command": "python",
       "args": ["-m", "engram.integrations.mcp_server"],
       "env": {
-        "ENGRAM_API_URL": "http://localhost:5820"
+        "ENGRAM_API_URL": "http://localhost:5820",
+        "ENGRAM_API_KEY": "eng_sk_..."
       }
     }
   }
 }
 ```
 
-Replace the executable path with your actual absolute path (on Windows, use the
-venv's `Scripts\\python.exe` and escape backslashes in JSON). Restart Claude
-Desktop after saving. For Cloud access through this bridge, set `ENGRAM_API_URL`
-to `https://api.engram.so` and add `ENGRAM_API_KEY` with your Engram API key to
-`env`. Self-hosted OSS has no account authentication and does not require a key.
-The bridge forwards a configured key as an HTTP Bearer token.
-
-Tools: `engram_list_contexts`, `engram_recall`, `engram_commit`, `engram_decide`,
-`engram_health`, `engram_create_context`; the original unprefixed tools remain
-available. Ask Claude to list your contexts to verify an actual API call.
+Tools: `engram_list_contexts`, `engram_recall`, `engram_commit`, `engram_decide`, `engram_health`, `engram_create_context`
 
 ### OpenAI Function Calling
 
@@ -907,6 +880,14 @@ All settings via environment variables or `.env` file:
 | `ENGRAM_VALIDITY_GATE_MODEL` | `claude-haiku-4-5` | Model used by the validity gate when enabled |
 | **Embedding** | | |
 | `ENGRAM_EMBEDDING_MODEL` | `text-embedding-3-small` | For bullet similarity search **and** worked-example retrieval over the activity ledger |
+| **Consolidation** | | |
+| `ENGRAM_CONSOLIDATION_TRIGGER` | `every_10_commits` | When to run consolidation |
+| `ENGRAM_FAST_DECAY_RATE` | `0.97` | Per-day salience decay (normal bullets) |
+| `ENGRAM_SLOW_DECAY_RATE` | `0.995` | Per-day decay (decisions/schemas) |
+| **Auth** | | |
+| `ENGRAM_AUTH_ENABLED` | `false` | Enable multi-tenant auth |
+| `COGNITO_USER_POOL_ID` | — | AWS Cognito user pool |
+| `COGNITO_APP_CLIENT_ID` | — | AWS Cognito app client |
 
 ## Development
 
@@ -988,4 +969,3 @@ please email logos@engram.so (company + use case).
 For large-scale deployments (>20,000 external users), we offer paid support
 and an enterprise agreement — contact logos@engram.so.
 
-Upgrade requirements and preserved interfaces are documented in [Compatibility and upgrade notes](docs/backward-compatibility.md).

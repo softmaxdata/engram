@@ -167,7 +167,7 @@ async def invalidate_concepts(
     if req.bullet_ids:
         for bullet_id in req.bullet_ids:
             bullet = await storage.get_bullet(bullet_id)
-            if bullet and bullet.context_id == str(context_id):
+            if bullet:
                 bullet.is_active = False
                 await storage.update_bullet(bullet)
                 result["invalidated_bullets"].append(bullet_id)

@@ -15,9 +15,10 @@ import math
 import time
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from engram.core.concurrency import ContextLockManager
-from engram.core.delta import DeltaEngine, capacity_checked_transaction
+from engram.core.delta import DeltaEngine
 from engram.core.events import EventBus
 from engram.core.models import (
     Bullet,
@@ -29,9 +30,8 @@ from engram.core.models import (
     DeltaOpType,
     DeltaSource,
     LifecycleConfig,
-    LifecycleState,
+    SchemaNode,
 )
-from engram.core.similarity import validated_cosine_similarity
 from engram.llm.adapter import LLMAdapter
 from engram.storage.base import StorageBackend
 
@@ -149,27 +149,6 @@ class ConsolidationEngine:
 
         return report
 
-    @staticmethod
-    async def _locked_active_bullets(
-        storage: StorageBackend, context_id: str, **filters
-    ) -> list[Bullet]:
-        candidates = await storage.list_bullets(context_id, include_archived=False, **filters)
-        current = []
-        # Deterministic row-lock order avoids lock inversions across candidates.
-        for bullet_id in sorted({bullet.id for bullet in candidates}):
-            bullet = await storage.get_bullet(bullet_id)
-            if (bullet is None or bullet.context_id != context_id or not bullet.is_active
-                    or bullet.is_archived or bullet.lifecycle_state != LifecycleState.ACTIVE):
-                continue
-            if filters.get("section") is not None and bullet.section != filters["section"]:
-                continue
-            if (filters.get("bullet_type") is not None
-                    and bullet.bullet_type != filters["bullet_type"]):
-                continue
-            current.append(bullet)
-        current.sort(key=lambda bullet: (bullet.salience, bullet.created_at), reverse=True)
-        return current
-
     async def _apply_forgetting_curve(
         self, context_id: str, config: ConsolidationConfig
     ) -> int:
@@ -179,35 +158,34 @@ class ConsolidationEngine:
         Concepts that ARE recalled get their decay reset (spaced repetition).
         DECISION and SCHEMA bullets have slower decay rates.
         """
-        async with self.storage.transaction(context_id) as tx:
-            bullets = await self._locked_active_bullets(tx, context_id)
-            decayed_count = 0
-            now = _utcnow()
+        bullets = await self.storage.list_bullets(context_id, include_archived=False)
+        decayed_count = 0
+        now = _utcnow()
 
-            for bullet in bullets:
-                reference_time = bullet.last_recalled_at or bullet.created_at
-                days_since_active = max(0, (now - reference_time).total_seconds() / 86400)
+        for bullet in bullets:
+            reference_time = bullet.last_recalled_at or bullet.created_at
+            days_since_active = max(0, (now - reference_time).total_seconds() / 86400)
 
-                if days_since_active <= 1:
-                    continue
+            if days_since_active <= 1:
+                continue
 
-                bt = bullet.bullet_type.value if hasattr(bullet.bullet_type, 'value') else str(bullet.bullet_type)
-                if bt in ("decision", "principle"):
-                    decay_rate = config.slow_decay_rate
-                elif bt == "exception":
-                    decay_rate = 0.99
-                else:
-                    decay_rate = config.fast_decay_rate
+            bt = bullet.bullet_type.value if hasattr(bullet.bullet_type, 'value') else str(bullet.bullet_type)
+            if bt in ("decision", "principle"):
+                decay_rate = config.slow_decay_rate
+            elif bt == "exception":
+                decay_rate = 0.99
+            else:
+                decay_rate = config.fast_decay_rate
 
-                new_salience = bullet.salience * (decay_rate ** days_since_active)
-                new_salience = max(config.min_salience, new_salience)
+            new_salience = bullet.salience * (decay_rate ** days_since_active)
+            new_salience = max(config.min_salience, new_salience)
 
-                if abs(new_salience - bullet.salience) > 0.001:
-                    bullet.salience = new_salience
-                    await tx.update_bullet(bullet)
-                    decayed_count += 1
+            if abs(new_salience - bullet.salience) > 0.001:
+                bullet.salience = new_salience
+                await self.storage.update_bullet(bullet)
+                decayed_count += 1
 
-            return decayed_count
+        return decayed_count
 
     async def _semantic_dedup(
         self, context_id: str, config: ConsolidationConfig
@@ -218,39 +196,30 @@ class ConsolidationEngine:
         If cosine similarity > threshold (default 0.92), merge by
         keeping the more specific/higher-salience bullet.
         """
-        # Candidate reads and donor removals share the same context transaction.
-        # A failed write cannot leave usage counted in both donor and survivor.
-        async with self.storage.transaction(context_id) as tx:
-            bullets = await self._locked_active_bullets(tx, context_id)
-            merged_ids: set[str] = set()
-            operations: list[DeltaOperation] = []
-            for i, bullet_a in enumerate(bullets):
-                if bullet_a.id in merged_ids or bullet_a.embedding is None:
+        bullets = await self.storage.list_bullets(context_id, include_archived=False)
+        merged_ids: set[str] = set()
+        merge_count = 0
+
+        for i, bullet_a in enumerate(bullets):
+            if bullet_a.id in merged_ids or bullet_a.embedding is None:
+                continue
+            for bullet_b in bullets[i + 1:]:
+                if bullet_b.id in merged_ids or bullet_b.embedding is None:
                     continue
-                for bullet_b in bullets[i + 1:]:
-                    if bullet_b.id in merged_ids or bullet_b.embedding is None:
-                        continue
-                    sim = validated_cosine_similarity(bullet_a.embedding, bullet_b.embedding)
-                    if sim is None or sim < config.dedup_threshold:
-                        continue
-                    keep, remove = (
-                        (bullet_a, bullet_b) if bullet_a.salience >= bullet_b.salience
-                        else (bullet_b, bullet_a)
-                    )
-                    operations.append(DeltaOperation(
-                        op_type=DeltaOpType.MERGE_BULLETS,
-                        target_ids=[keep.id, remove.id],
-                        source=DeltaSource.CONSOLIDATION,
-                        reasoning="Semantic deduplication during consolidation",
-                    ))
+                sim = _cosine_similarity(bullet_a.embedding, bullet_b.embedding)
+                if sim >= config.dedup_threshold:
+                    # Keep the one with higher salience
+                    keep, remove = (bullet_a, bullet_b) if bullet_a.salience >= bullet_b.salience else (bullet_b, bullet_a)
+                    keep.recall_count += remove.recall_count
+                    keep.hit_count += remove.hit_count
+                    keep.miss_count += remove.miss_count
+                    keep.salience = max(keep.salience, remove.salience)
+                    await self.storage.update_bullet(keep)
+                    await self.storage.remove_bullet(remove.id)
                     merged_ids.add(remove.id)
-                    if remove.id == bullet_a.id:
-                        break
-            if operations:
-                await DeltaEngine(tx).apply_batch(DeltaBatch(
-                    context_id=context_id, operations=operations, trigger="consolidation",
-                ))
-            return len(operations)
+                    merge_count += 1
+
+        return merge_count
 
     async def _induce_schemas(
         self, context_id: str, config: ConsolidationConfig
@@ -286,42 +255,28 @@ class ConsolidationEngine:
                         + "\n".join(f"- {c}" for c in bullet_contents)
                         + "\n\nDescribe the abstract pattern they share in 1-2 sentences."
                     ),
-                    system=(
-                        "You are a knowledge organizer. Respond with a concise description only."
-                    ),
+                    system="You are a knowledge organizer. Respond with a concise description only.",
                     temperature=0.0,
                     max_tokens=200,
                 )
             except Exception:
                 description = f"Pattern in {section} ({len(section_list)} bullets)"
 
-            expected_contents = {bullet.id: bullet.content for bullet in section_list}
-            async with self.storage.transaction(context_id) as tx:
-                if any(schema.name == section for schema in await tx.list_schemas(context_id)):
-                    continue
-                current = await self._locked_active_bullets(tx, context_id, section=section)
-                eligible = [bullet for bullet in current if bullet.schema_id is None
-                            and expected_contents.get(bullet.id) == bullet.content]
-                if len(eligible) < config.schema_min_instances:
-                    continue
-                schema_id = str(uuid.uuid4())[:8]
-                await DeltaEngine(tx).apply_batch(DeltaBatch(
-                    context_id=context_id, trigger="consolidation_schema",
-                    operations=[DeltaOperation(
-                        op_type=DeltaOpType.ADD_SCHEMA, target_id=schema_id,
-                        content=section, reasoning=description.strip(),
-                        source=DeltaSource.CONSOLIDATION,
-                    )],
-                ))
-                schema = await tx.get_schema(schema_id)
-                schema.instance_count = len(eligible)
-                schema.confidence = min(1.0, len(eligible) / 10)
-                schema.bullet_ids = [bullet.id for bullet in eligible]
-                await tx.update_schema(schema)
-                for bullet in eligible:
-                    bullet.schema_id = schema.id
-                    await tx.update_bullet(bullet)
-                schemas_formed += 1
+            schema = SchemaNode(
+                name=section,
+                description=description.strip(),
+                instance_count=len(section_list),
+                confidence=min(1.0, len(section_list) / 10),
+                bullet_ids=[b.id for b in section_list],
+            )
+            await self.storage.add_schema(context_id, schema)
+
+            # Link bullets to schema
+            for bullet in section_list:
+                bullet.schema_id = schema.id
+                await self.storage.update_bullet(bullet)
+
+            schemas_formed += 1
 
         return schemas_formed
 
@@ -335,31 +290,30 @@ class ConsolidationEngine:
         in archive_days_threshold+ days AND not a DECISION or PRINCIPLE type.
         v0.3: Uses storage.archive_bullet() for proper lifecycle state transitions.
         """
-        async with self.storage.transaction(context_id) as tx:
-            bullets = await self._locked_active_bullets(tx, context_id)
-            archived_count = 0
-            now = _utcnow()
+        bullets = await self.storage.list_bullets(context_id, include_archived=False)
+        archived_count = 0
+        now = _utcnow()
 
-            for bullet in bullets:
-                bt = bullet.bullet_type.value if hasattr(bullet.bullet_type, 'value') else str(bullet.bullet_type)
-                if bt in ("decision", "principle"):
-                    continue
+        for bullet in bullets:
+            bt = bullet.bullet_type.value if hasattr(bullet.bullet_type, 'value') else str(bullet.bullet_type)
+            if bt in ("decision", "principle"):
+                continue
 
-                if bullet.salience >= config.archive_salience_threshold:
-                    continue
+            if bullet.salience >= config.archive_salience_threshold:
+                continue
 
-                reference_time = bullet.last_recalled_at or bullet.created_at
-                days_inactive = (now - reference_time).total_seconds() / 86400
-                if days_inactive < config.archive_days_threshold:
-                    continue
+            reference_time = bullet.last_recalled_at or bullet.created_at
+            days_inactive = (now - reference_time).total_seconds() / 86400
+            if days_inactive < config.archive_days_threshold:
+                continue
 
-                success = await tx.archive_bullet(
-                    context_id, bullet.id, reason="consolidation_stale"
-                )
-                if success:
-                    archived_count += 1
+            success = await self.storage.archive_bullet(
+                context_id, bullet.id, reason="consolidation_stale"
+            )
+            if success:
+                archived_count += 1
 
-            return archived_count
+        return archived_count
 
     async def _promote_to_principles(
         self, context_id: str, config: ConsolidationConfig
@@ -410,35 +364,17 @@ class ConsolidationEngine:
             except Exception:
                 continue
 
-            expected_contents = {bullet.id: bullet.content for bullet in facts}
-            async with capacity_checked_transaction(self.storage, context_id) as tx:
-                current = await self._locked_active_bullets(tx, context_id, section=section)
-                if any(bullet.bullet_type == BulletType.PRINCIPLE for bullet in current):
-                    continue
-                eligible = [bullet for bullet in current
-                            if bullet.bullet_type == BulletType.FACT and bullet.hit_count >= 2
-                            and expected_contents.get(bullet.id) == bullet.content]
-                if len(eligible) < config.schema_min_instances or not principle.strip():
-                    continue
-                context = await tx.get_context(uuid.UUID(context_id))
-                if context is not None:
-                    maximum = context.lifecycle_config.max_active_bullets
-                    capacity = await tx.get_capacity_status(context_id, maximum)
-                    if capacity.active_bullet_count >= maximum:
-                        continue
-                bullet_id = str(uuid.uuid4())[:8]
-                await DeltaEngine(tx).apply_batch(DeltaBatch(
-                    context_id=context_id, trigger="consolidation_promotion",
-                    operations=[DeltaOperation(
-                        op_type=DeltaOpType.ADD_BULLET, target_id=bullet_id,
-                        section=section, content=principle.strip(), bullet_type="principle",
-                        source=DeltaSource.CONSOLIDATION, confidence=min(1.0, len(eligible) / 10),
-                    )],
-                ))
-                principle_bullet = await tx.get_bullet(bullet_id)
-                principle_bullet.salience = 0.8
-                await tx.update_bullet(principle_bullet)
-                promoted += 1
+            # Create principle bullet
+            principle_bullet = Bullet(
+                section=section,
+                content=principle.strip(),
+                bullet_type=BulletType.PRINCIPLE,
+                source_type="consolidation",
+                salience=0.8,
+                confidence=min(1.0, len(facts) / 10),
+            )
+            await self.storage.add_bullet(context_id, principle_bullet)
+            promoted += 1
 
         return promoted
 

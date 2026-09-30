@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
-import copy
 import json
 import logging
 import uuid
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import aiosqlite
@@ -31,9 +27,6 @@ from engram.core.models import (
 )
 from engram.core.similarity import cosine_similarity as _cosine_similarity
 from engram.storage.base import StorageBackend
-from engram.storage.transactions import (
-    SQLiteTransactionConnection, TaskGate, TransactionScope, finish, guarded_backend,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -42,118 +35,24 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-@guarded_backend
 class SQLiteBackend(StorageBackend):
     """SQLite-based storage for local development without Docker dependencies."""
 
-    def __init__(
-        self, db_path: str = "./engram.db", *, read_only: bool = False,
-        existing_only: bool = False,
-    ) -> None:
+    def __init__(self, db_path: str = "./engram.db") -> None:
         self.db_path = db_path
-        self.read_only = read_only
-        self.existing_only = existing_only or read_only
         self._db: aiosqlite.Connection | None = None
-        self._connect_lock = asyncio.Lock()
-        self._gate = TaskGate()
-        self._scope: TransactionScope | None = None
-        self._transaction_owner: asyncio.Task | None = None
 
-    @asynccontextmanager
-    async def _operation(self, name: str):
-        if self._scope is not None:
-            self._scope.check()
-            if name in {"initialize", "close"}:
-                raise RuntimeError(f"Cannot {name} a transaction handle")
-            yield
-            return
-        if self._transaction_owner is asyncio.current_task():
-            raise RuntimeError("Use the scoped transaction handle, not its parent")
-        outermost = self._gate.owner is not asyncio.current_task()
-        async with self._gate.hold():
-            try:
-                yield
-            except BaseException:
-                # Ordinary methods also must not leave an implicit write open
-                # for a later unrelated caller to commit after cancellation.
-                if outermost and self._db is not None:
-                    await finish(self._db.rollback())
-                raise
-
-    async def _get_db(self):
-        if self._scope is not None:
-            self._scope.check()
-            return SQLiteTransactionConnection(self._db, self._scope)
-        async with self._connect_lock:
-            if self._db is None:
-                path = self.db_path
-                if self.existing_only:
-                    if path == ":memory:":
-                        raise ValueError("Existing-only storage requires an existing SQLite file")
-                    mode = "ro" if self.read_only else "rw"
-                    path = Path(path).expanduser().resolve().as_uri() + f"?mode={mode}"
-                db = await aiosqlite.connect(path, uri=self.existing_only, timeout=30)
-                try:
-                    db.row_factory = aiosqlite.Row
-                    if not self.read_only:
-                        await db.execute("PRAGMA journal_mode=WAL")
-                    await db.execute("PRAGMA foreign_keys=ON")
-                except BaseException:
-                    await finish(db.close())
-                    raise
-                self._db = db
-            return self._db
-
-    @asynccontextmanager
-    async def transaction(self, context_id: str):
-        if self.read_only:
-            raise RuntimeError("Read-only storage cannot start a write transaction")
-        if self._scope is not None:
-            self._scope.check()
-            if str(context_id) != self._scope.context_id:
-                raise ValueError("Nested transactions must use the same context")
-            db = self._db
-            savepoint = "engram_" + uuid.uuid4().hex
-            scoped = copy.copy(self)
-            scoped._scope = TransactionScope(str(context_id), asyncio.current_task())
-            try:
-                await db.execute(f"SAVEPOINT {savepoint}")
-                yield scoped
-            except BaseException:
-                await finish(db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}"))
-                await finish(db.execute(f"RELEASE SAVEPOINT {savepoint}"))
-                raise
-            else:
-                await finish(db.execute(f"RELEASE SAVEPOINT {savepoint}"))
-            finally:
-                scoped._scope.active = False
-            return
-        if self._transaction_owner is asyncio.current_task():
-            raise RuntimeError("Nested transactions require the scoped transaction handle")
-        async with self._gate.hold():
-            db = await self._get_db()
-            scoped = copy.copy(self)
-            scoped._scope = TransactionScope(str(context_id), asyncio.current_task())
-            self._transaction_owner = asyncio.current_task()
-            try:
-                # Acquire the database writer lock before any reads, including
-                # across independent connections/processes using the same file.
-                try:
-                    await db.execute("BEGIN IMMEDIATE")
-                    yield scoped
-                    await finish(db.commit())
-                except BaseException:
-                    await finish(db.rollback())
-                    raise
-            finally:
-                scoped._scope.active = False
-                self._transaction_owner = None
+    async def _get_db(self) -> aiosqlite.Connection:
+        if self._db is None:
+            self._db = await aiosqlite.connect(self.db_path)
+            self._db.row_factory = aiosqlite.Row
+            await self._db.execute("PRAGMA journal_mode=WAL")
+            await self._db.execute("PRAGMA foreign_keys=ON")
+        return self._db
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
     async def initialize(self) -> None:
-        if self.read_only or self.existing_only:
-            raise RuntimeError("Existing-only storage cannot initialize or migrate")
         db = await self._get_db()
         await db.executescript(
             """
@@ -328,12 +227,6 @@ class SQLiteBackend(StorageBackend):
         logger.info("SQLite storage initialized at %s", self.db_path)
 
     async def _migrate_v03(self, db: aiosqlite.Connection) -> None:
-        # ALTER and archive backfill must commit together. A failed backfill
-        # cannot leave a default-active column that makes the retry skip repair.
-        async with self.transaction("__engram_lifecycle_migration__") as tx:
-            await self._migrate_v03_columns(await tx._get_db())
-
-    async def _migrate_v03_columns(self, db: aiosqlite.Connection) -> None:
         """Add v0.3 lifecycle columns if they don't exist."""
         # Check if lifecycle_state column exists on bullets
         cursor = await db.execute("PRAGMA table_info(bullets)")
@@ -342,11 +235,6 @@ class SQLiteBackend(StorageBackend):
         if "lifecycle_state" not in cols:
             await db.execute(
                 "ALTER TABLE bullets ADD COLUMN lifecycle_state TEXT DEFAULT 'active'"
-            )
-            # Pre-v0.3 archives already carry is_archived. Preserve that state
-            # when adding the lifecycle column so restores/purges still work.
-            await db.execute(
-                "UPDATE bullets SET lifecycle_state='archived' WHERE is_archived=1"
             )
             logger.info("Added lifecycle_state column to bullets")
 
@@ -430,10 +318,8 @@ class SQLiteBackend(StorageBackend):
 
     async def close(self) -> None:
         if self._db is not None:
-            try:
-                await finish(self._db.close())
-            finally:
-                self._db = None
+            await self._db.close()
+            self._db = None
 
     # ── Context CRUD ───────────────────────────────────────────────────
 
@@ -605,18 +491,6 @@ class SQLiteBackend(StorageBackend):
         await db.commit()
         return bullet
 
-    async def update_bullet_embedding_if_missing(
-        self, context_id: str, bullet_id: str, content: str, embedding: list[float],
-    ) -> bool:
-        db = await self._get_db()
-        cursor = await db.execute(
-            "UPDATE bullets SET embedding=? WHERE id=? AND context_id=? AND content=? "
-            "AND embedding IS NULL AND is_active=1 AND is_archived=0 AND lifecycle_state='active'",
-            (json.dumps(embedding), bullet_id, context_id, content),
-        )
-        await db.commit()
-        return cursor.rowcount > 0
-
     async def get_bullet(self, bullet_id: str) -> Bullet | None:
         db = await self._get_db()
         cursor = await db.execute("SELECT * FROM bullets WHERE id = ?", (bullet_id,))
@@ -752,22 +626,6 @@ class SQLiteBackend(StorageBackend):
         schema.updated_at = datetime.fromisoformat(now)
         return schema
 
-    async def remove_schema(self, context_id: str, schema_id: str) -> bool:
-        """Remove one schema and clear its local bullet links atomically."""
-        async with self.transaction(context_id) as tx:
-            schema = await tx.get_schema(schema_id)
-            if schema is None or schema.context_id != context_id:
-                return False
-            db = await tx._get_db()
-            await db.execute(
-                "UPDATE bullets SET schema_id=NULL WHERE context_id=? AND schema_id=?",
-                (context_id, schema_id),
-            )
-            cursor = await db.execute(
-                "DELETE FROM schemas WHERE context_id=? AND id=?", (context_id, schema_id),
-            )
-            return cursor.rowcount > 0
-
     # ── Delta History (v0.2) ───────────────────────────────────────────
 
     async def save_delta_batch(self, delta_batch: DeltaBatch) -> DeltaBatch:
@@ -878,56 +736,52 @@ class SQLiteBackend(StorageBackend):
         return await self.get_bullet(bullet_id)
 
     async def purge_bullet(self, context_id: str, bullet_id: str) -> bool:
-        # Keep candidate eligibility and all dependent deletions together.
-        async with self.transaction(context_id) as tx:
-            db = await tx._get_db()
-            # Delete connected edges first
-            await db.execute(
-                "DELETE FROM edges WHERE context_id=? AND (from_node=? OR to_node=?)",
-                (context_id, bullet_id, bullet_id),
-            )
-            result = await db.execute(
-                "DELETE FROM bullets WHERE id=? AND context_id=?",
-                (bullet_id, context_id),
-            )
-            await db.commit()
-            return result.rowcount > 0  # type: ignore[union-attr]
+        db = await self._get_db()
+        # Delete connected edges first
+        await db.execute(
+            "DELETE FROM edges WHERE context_id=? AND (from_node=? OR to_node=?)",
+            (context_id, bullet_id, bullet_id),
+        )
+        result = await db.execute(
+            "DELETE FROM bullets WHERE id=? AND context_id=?",
+            (bullet_id, context_id),
+        )
+        await db.commit()
+        return result.rowcount > 0  # type: ignore[union-attr]
 
     async def purge_expired_archives(
         self, context_id: str, purge_after_days: int = 180
     ) -> int:
-        # Keep candidate eligibility and all dependent deletions together.
-        async with self.transaction(context_id) as tx:
-            db = await tx._get_db()
-            from datetime import timedelta
-            cutoff = (_utcnow() - timedelta(days=purge_after_days)).isoformat()
+        db = await self._get_db()
+        from datetime import timedelta
+        cutoff = (_utcnow() - timedelta(days=purge_after_days)).isoformat()
 
-            # Get bullet IDs to purge (for edge cleanup)
-            cursor = await db.execute(
-                "SELECT id FROM bullets WHERE context_id=? AND lifecycle_state='archived' "
-                "AND archived_at IS NOT NULL AND archived_at < ?",
-                (context_id, cutoff),
-            )
-            bullet_ids = [row[0] for row in await cursor.fetchall()]
+        # Get bullet IDs to purge (for edge cleanup)
+        cursor = await db.execute(
+            "SELECT id FROM bullets WHERE context_id=? AND lifecycle_state='archived' "
+            "AND archived_at IS NOT NULL AND archived_at < ?",
+            (context_id, cutoff),
+        )
+        bullet_ids = [row[0] for row in await cursor.fetchall()]
 
-            if not bullet_ids:
-                return 0
+        if not bullet_ids:
+            return 0
 
-            # Delete connected edges
-            placeholders = ",".join("?" * len(bullet_ids))
-            await db.execute(
-                f"DELETE FROM edges WHERE context_id=? AND "
-                f"(from_node IN ({placeholders}) OR to_node IN ({placeholders}))",
-                [context_id] + bullet_ids + bullet_ids,
-            )
+        # Delete connected edges
+        placeholders = ",".join("?" * len(bullet_ids))
+        await db.execute(
+            f"DELETE FROM edges WHERE context_id=? AND "
+            f"(from_node IN ({placeholders}) OR to_node IN ({placeholders}))",
+            [context_id] + bullet_ids + bullet_ids,
+        )
 
-            # Delete the bullets
-            result = await db.execute(
-                f"DELETE FROM bullets WHERE context_id=? AND id IN ({placeholders})",
-                [context_id] + bullet_ids,
-            )
-            await db.commit()
-            return result.rowcount or 0  # type: ignore[union-attr]
+        # Delete the bullets
+        result = await db.execute(
+            f"DELETE FROM bullets WHERE context_id=? AND id IN ({placeholders})",
+            [context_id] + bullet_ids,
+        )
+        await db.commit()
+        return result.rowcount or 0  # type: ignore[union-attr]
 
     async def get_archived_bullets(
         self, context_id: str, offset: int = 0, limit: int = 50
@@ -1319,7 +1173,6 @@ class SQLiteBackend(StorageBackend):
     def _row_to_concept(row: aiosqlite.Row) -> ConceptNode:
         return ConceptNode(
             id=uuid.UUID(row["id"]), type=row["type"], content=row["content"],
-            context_id=uuid.UUID(row["context_id"]),
             embedding=json.loads(row["embedding"]) if row["embedding"] else None,
             confidence=row["confidence"], salience=row["salience"],
             created_at=datetime.fromisoformat(row["created_at"]),

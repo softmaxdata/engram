@@ -5,13 +5,9 @@ Uses asyncpg for async PostgreSQL access and pgvector for embedding similarity s
 
 from __future__ import annotations
 
-import asyncio
-import copy
-import hashlib
 import json
 import logging
 import uuid
-from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -35,26 +31,12 @@ from engram.core.models import (
     SlotDefinition,
 )
 from engram.storage.base import StorageBackend
-from engram.storage.transactions import (
-    PostgresTransactionConnection, TransactionScope, finish, guarded_backend,
-)
 
 logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _vector_to_list(value) -> list[float] | None:
-    """Normalize pgvector 0.5 Vector and earlier numpy-backed codec results."""
-    if value is None:
-        return None
-    if hasattr(value, "to_list"):
-        return value.to_list()
-    if hasattr(value, "tolist"):
-        return value.tolist()
-    return list(value)
 
 
 def _get_rowcount(status: str) -> int:
@@ -65,107 +47,22 @@ def _get_rowcount(status: str) -> int:
         return 0
 
 
-@guarded_backend
 class PostgresBackend(StorageBackend):
     """PostgreSQL-based storage for production deployment with pgvector similarity search."""
     
-    def __init__(
-        self, dsn: str, *, read_only: bool = False, existing_only: bool = False,
-    ) -> None:
+    def __init__(self, dsn: str) -> None:
         self.dsn = dsn
-        self.read_only = read_only
-        self.existing_only = existing_only or read_only
         self._pool: asyncpg.Pool | None = None
-        self._pool_lock = asyncio.Lock()
-        self._scope: TransactionScope | None = None
-        self._connection = None
-        self._active_transactions: set[asyncio.Task] = set()
 
-    @asynccontextmanager
-    async def _operation(self, name: str):
-        if self._scope is not None:
-            self._scope.check()
-            if name in {"initialize", "close"}:
-                raise RuntimeError(f"Cannot {name} a transaction handle")
-        elif asyncio.current_task() in self._active_transactions:
-            raise RuntimeError("Use the scoped transaction handle, not its parent")
-        elif name == "initialize" and self._active_transactions:
-            raise RuntimeError("Cannot initialize storage during a transaction")
-        yield
-
-    async def _get_pool(self):
-        if self._scope is not None:
-            self._scope.check()
-            return PostgresTransactionConnection(self._connection, self._scope)
-        async with self._pool_lock:
-            if self._pool is None:
-                if not self.existing_only:
-                    # Codecs require vector to exist before the first pooled connection.
-                    bootstrap = await asyncpg.connect(self.dsn)
-                    try:
-                        await bootstrap.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                    finally:
-                        await finish(bootstrap.close())
-                options = {}
-                if self.read_only:
-                    options["server_settings"] = {"default_transaction_read_only": "on"}
-                # Keep the awaitable Pool object while it initializes: asyncpg
-                # may open earlier connections before a later init hook fails.
-                pool = asyncpg.create_pool(
-                    self.dsn, min_size=2, max_size=10, init=self._init_connection, **options,
-                )
-                try:
-                    await pool
-                except BaseException:
-                    pool.terminate()
-                    raise
-                self._pool = pool
-            return self._pool
-
-    @asynccontextmanager
-    async def transaction(self, context_id: str):
-        if self.read_only:
-            raise RuntimeError("Read-only storage cannot start a write transaction")
-        if self._scope is not None:
-            self._scope.check()
-            if str(context_id) != self._scope.context_id:
-                raise ValueError("Nested transactions must use the same context")
-            scoped = copy.copy(self)
-            scoped._scope = TransactionScope(str(context_id), asyncio.current_task())
-            try:
-                async with self._connection.transaction():
-                    yield scoped
-            finally:
-                scoped._scope.active = False
-            return
-        task = asyncio.current_task()
-        if task in self._active_transactions:
-            raise RuntimeError("Nested transactions require the scoped transaction handle")
-        pool = await self._get_pool()
-        self._active_transactions.add(task)
-        try:
-            async with pool.acquire() as connection:
-                scoped = copy.copy(self)
-                scoped._connection = connection
-                scoped._scope = TransactionScope(str(context_id), task)
-                try:
-                    async with connection.transaction():
-                        # Stable across processes; collisions merely serialize unrelated contexts.
-                        key = int.from_bytes(
-                            hashlib.sha256(str(context_id).encode()).digest()[:8], "big", signed=True,
-                        )
-                        await connection.execute("SELECT pg_advisory_xact_lock($1)", key)
-                        # Take the parent lock before child rows. Otherwise a
-                        # cascading context delete can deadlock against the
-                        # parent FK check when this transaction saves its audit.
-                        await connection.fetchrow(
-                            "SELECT id FROM contexts WHERE id=$1 FOR KEY SHARE", str(context_id),
-                        )
-                        yield scoped
-                finally:
-                    scoped._scope.active = False
-        finally:
-            self._active_transactions.discard(task)
+    async def _get_pool(self) -> asyncpg.Pool:
+        if self._pool is None:
+            self._pool = await asyncpg.create_pool(
+                self.dsn,
+                min_size=2,
+                max_size=10,
+                init=self._init_connection,
+            )
+        return self._pool
 
     @staticmethod
     async def _init_connection(conn: asyncpg.Connection) -> None:
@@ -174,12 +71,12 @@ class PostgresBackend(StorageBackend):
     # ── Lifecycle ──────────────────────────────────────────────────────
 
     async def initialize(self) -> None:
-        if self.read_only or self.existing_only:
-            raise RuntimeError("Existing-only storage cannot initialize or migrate")
         pool = await self._get_pool()
 
         async with pool.acquire() as conn:
             async with conn.transaction():
+                await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS contexts (
                         id TEXT PRIMARY KEY,
@@ -392,7 +289,14 @@ class PostgresBackend(StorageBackend):
                     "CREATE INDEX IF NOT EXISTS idx_activities_timestamp ON activities(timestamp)"
                 )
                 await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_bullets_lifecycle ON bullets(lifecycle_state)"
+                )
+                await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_bullets_archived_at ON bullets(archived_at)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_activities_raw_input_hash "
+                    "ON activities(context_id, raw_input_hash)"
                 )
 
         # Schema migrations for existing databases
@@ -414,21 +318,10 @@ class PostgresBackend(StorageBackend):
         return row is not None
 
     async def _migrate_v03(self, pool: asyncpg.Pool) -> None:
-        # ALTER and archive backfill must commit together. A failed backfill
-        # cannot leave a default-active column that makes the retry skip repair.
-        async with self.transaction("__engram_lifecycle_migration__") as tx:
-            await self._migrate_v03_columns(await tx._get_pool())
-
-    async def _migrate_v03_columns(self, pool: asyncpg.Pool) -> None:
         """Add v0.3 lifecycle columns if they don't exist."""
         if not await self._column_exists(pool, "bullets", "lifecycle_state"):
             await pool.execute(
                 "ALTER TABLE bullets ADD COLUMN lifecycle_state TEXT DEFAULT 'active'"
-            )
-            # Pre-v0.3 archives already carry is_archived. Preserve that state
-            # when adding the lifecycle column so restores/purges still work.
-            await pool.execute(
-                "UPDATE bullets SET lifecycle_state='archived' WHERE is_archived=TRUE"
             )
             logger.info("Added lifecycle_state column to bullets")
 
@@ -494,12 +387,9 @@ class PostgresBackend(StorageBackend):
             logger.info("Added reconsolidated_at column to materializations")
 
     async def close(self) -> None:
-        async with self._pool_lock:
-            if self._pool is not None:
-                try:
-                    await finish(self._pool.close())
-                finally:
-                    self._pool = None
+        if self._pool is not None:
+            await self._pool.close()
+            self._pool = None
 
     # ── Context CRUD ───────────────────────────────────────────────────
 
@@ -672,25 +562,9 @@ class PostgresBackend(StorageBackend):
         )
         return bullet
 
-    async def update_bullet_embedding_if_missing(
-        self, context_id: str, bullet_id: str, content: str, embedding: list[float],
-    ) -> bool:
-        pool = await self._get_pool()
-        status = await pool.execute(
-            "UPDATE bullets SET embedding=$1 WHERE id=$2 AND context_id=$3 AND content=$4 "
-            "AND embedding IS NULL AND is_active=TRUE AND is_archived=FALSE "
-            "AND lifecycle_state='active'",
-            np.array(embedding, dtype=np.float32), bullet_id, context_id, content,
-        )
-        return _get_rowcount(status) > 0
-
     async def get_bullet(self, bullet_id: str) -> Bullet | None:
         pool = await self._get_pool()
-        query = "SELECT * FROM bullets WHERE id = $1"
-        if self._scope is not None:
-            # Guard read-modify-write against direct archive/update operations too.
-            query += " FOR UPDATE"
-        row = await pool.fetchrow(query, bullet_id)
+        row = await pool.fetchrow("SELECT * FROM bullets WHERE id = $1", bullet_id)
         return self._row_to_bullet(row) if row else None
 
     async def list_bullets(
@@ -765,7 +639,6 @@ class PostgresBackend(StorageBackend):
               AND is_active = TRUE
               AND is_archived = FALSE
               AND embedding IS NOT NULL
-              AND (embedding <=> $1::vector) BETWEEN 0 AND 2
               AND 1 - (embedding <=> $1::vector) >= $3
             ORDER BY similarity DESC
             LIMIT $4
@@ -832,22 +705,6 @@ class PostgresBackend(StorageBackend):
         )
         schema.updated_at = now
         return schema
-
-    async def remove_schema(self, context_id: str, schema_id: str) -> bool:
-        """Remove one schema and clear its local bullet links atomically."""
-        async with self.transaction(context_id) as tx:
-            schema = await tx.get_schema(schema_id)
-            if schema is None or schema.context_id != context_id:
-                return False
-            pool = await tx._get_pool()
-            await pool.execute(
-                "UPDATE bullets SET schema_id=NULL WHERE context_id=$1 AND schema_id=$2",
-                context_id, schema_id,
-            )
-            status = await pool.execute(
-                "DELETE FROM schemas WHERE context_id=$1 AND id=$2", context_id, schema_id,
-            )
-            return _get_rowcount(status) > 0
 
     # ── Delta History (v0.2) ───────────────────────────────────────────
 
@@ -957,52 +814,48 @@ class PostgresBackend(StorageBackend):
         return await self.get_bullet(bullet_id)
 
     async def purge_bullet(self, context_id: str, bullet_id: str) -> bool:
-        # Keep candidate eligibility and all dependent deletions together.
-        async with self.transaction(context_id) as tx:
-            pool = await tx._get_pool()
-            # Delete connected edges first
-            await pool.execute(
-                "DELETE FROM edges WHERE context_id=$1 AND (from_node=$2 OR to_node=$3)",
-                context_id, bullet_id, bullet_id,
-            )
-            status = await pool.execute(
-                "DELETE FROM bullets WHERE id=$1 AND context_id=$2",
-                bullet_id, context_id,
-            )
-            return _get_rowcount(status) > 0
+        pool = await self._get_pool()
+        # Delete connected edges first
+        await pool.execute(
+            "DELETE FROM edges WHERE context_id=$1 AND (from_node=$2 OR to_node=$3)",
+            context_id, bullet_id, bullet_id,
+        )
+        status = await pool.execute(
+            "DELETE FROM bullets WHERE id=$1 AND context_id=$2",
+            bullet_id, context_id,
+        )
+        return _get_rowcount(status) > 0
 
     async def purge_expired_archives(
         self, context_id: str, purge_after_days: int = 180
     ) -> int:
-        # Keep candidate eligibility and all dependent deletions together.
-        async with self.transaction(context_id) as tx:
-            pool = await tx._get_pool()
-            cutoff = _utcnow() - timedelta(days=purge_after_days)
+        pool = await self._get_pool()
+        cutoff = _utcnow() - timedelta(days=purge_after_days)
 
-            # Get bullet IDs to purge (for edge cleanup)
-            rows = await pool.fetch(
-                "SELECT id FROM bullets WHERE context_id=$1 AND lifecycle_state='archived' "
-                "AND archived_at IS NOT NULL AND archived_at < $2 ORDER BY id FOR UPDATE",
-                context_id, cutoff,
-            )
-            bullet_ids = [row["id"] for row in rows]
+        # Get bullet IDs to purge (for edge cleanup)
+        rows = await pool.fetch(
+            "SELECT id FROM bullets WHERE context_id=$1 AND lifecycle_state='archived' "
+            "AND archived_at IS NOT NULL AND archived_at < $2",
+            context_id, cutoff,
+        )
+        bullet_ids = [row["id"] for row in rows]
 
-            if not bullet_ids:
-                return 0
+        if not bullet_ids:
+            return 0
 
-            # Delete connected edges using ANY()
-            await pool.execute(
-                "DELETE FROM edges WHERE context_id=$1 AND "
-                "(from_node = ANY($2) OR to_node = ANY($2))",
-                context_id, bullet_ids,
-            )
+        # Delete connected edges using ANY()
+        await pool.execute(
+            "DELETE FROM edges WHERE context_id=$1 AND "
+            "(from_node = ANY($2) OR to_node = ANY($2))",
+            context_id, bullet_ids,
+        )
 
-            # Delete the bullets
-            status = await pool.execute(
-                "DELETE FROM bullets WHERE context_id=$1 AND id = ANY($2)",
-                context_id, bullet_ids,
-            )
-            return _get_rowcount(status)
+        # Delete the bullets
+        status = await pool.execute(
+            "DELETE FROM bullets WHERE context_id=$1 AND id = ANY($2)",
+            context_id, bullet_ids,
+        )
+        return _get_rowcount(status)
 
     async def get_archived_bullets(
         self, context_id: str, offset: int = 0, limit: int = 50
@@ -1151,7 +1004,6 @@ class PostgresBackend(StorageBackend):
             WHERE context_id = $2
               AND is_valid = TRUE
               AND embedding IS NOT NULL
-              AND (embedding <=> $1::vector) BETWEEN 0 AND 2
               AND 1 - (embedding <=> $1::vector) >= $3
             ORDER BY similarity DESC
             LIMIT $4
@@ -1343,7 +1195,7 @@ class PostgresBackend(StorageBackend):
 
     @staticmethod
     def _row_to_bullet(row: asyncpg.Record) -> Bullet:
-        keys = set(row.keys())
+        keys = row.keys()
         lifecycle_state_raw = row["lifecycle_state"] if "lifecycle_state" in keys else "active"
         archive_reason = row["archive_reason"] if "archive_reason" in keys else None
         emb = row["embedding"]
@@ -1351,7 +1203,7 @@ class PostgresBackend(StorageBackend):
             id=row["id"], context_id=row["context_id"], section=row["section"],
             content=row["content"], bullet_type=row["bullet_type"],
             source_type=row["source_type"],
-            embedding=_vector_to_list(emb),
+            embedding=emb.tolist() if emb is not None else None,
             hit_count=row["hit_count"], miss_count=row["miss_count"],
             recall_count=row["recall_count"],
             last_recalled_at=row["last_recalled_at"],
@@ -1400,8 +1252,7 @@ class PostgresBackend(StorageBackend):
         emb = row["embedding"]
         return ConceptNode(
             id=uuid.UUID(row["id"]), type=row["type"], content=row["content"],
-            context_id=uuid.UUID(row["context_id"]),
-            embedding=_vector_to_list(emb),
+            embedding=emb.tolist() if emb is not None else None,
             confidence=row["confidence"], salience=row["salience"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
@@ -1428,7 +1279,7 @@ class PostgresBackend(StorageBackend):
 
     @staticmethod
     def _row_to_activity(row: asyncpg.Record) -> Activity:
-        keys = set(row.keys())
+        keys = row.keys()
         # v0.4 fields — backward compatible via key check
         raw_input = row["raw_input"] if "raw_input" in keys else None
         raw_input_hash = row["raw_input_hash"] if "raw_input_hash" in keys else None

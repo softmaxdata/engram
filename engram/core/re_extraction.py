@@ -122,7 +122,8 @@ class ReExtractionEngine:
             return self._build_preview(all_operations, activities)
 
         # Apply all deltas
-        from engram.core.delta import DeltaEngine, capacity_checked_transaction
+        from engram.core.delta import DeltaEngine
+        delta_engine = DeltaEngine(self.storage)
 
         batch = DeltaBatch(
             context_id=context_id,
@@ -130,33 +131,28 @@ class ReExtractionEngine:
             trigger="re_extraction",
         )
 
-        async def persist_re_extraction():
-            async with capacity_checked_transaction(self.storage, context_id) as tx:
-                result_batch = await DeltaEngine(tx).apply_batch(batch)
-                # Record re-extraction event in activity ledger
-                import uuid as _uuid
-                await tx.add_activity(
-                    _uuid.UUID(context_id) if len(context_id) >= 32 else _uuid.uuid4(),
-                    Activity(
-                        agent_id="engram-system",
-                        action_type=ActionType.RE_EXTRACTION_RAN,
-                        summary=(
-                            f"Re-extracted with {request.reflector_model}: "
-                            f"{len(activities)} activities processed, "
-                            f"{len(all_operations)} delta operations"
-                        ),
-                        delta_batch_id=result_batch.id,
-                        extraction_model=request.reflector_model,
-                    ),
-                )
-
-                return result_batch
-
         if self.lock_manager is not None:
             async with self.lock_manager.acquire(context_id):
-                result_batch = await persist_re_extraction()
+                result_batch = await delta_engine.apply_batch(batch)
         else:
-            result_batch = await persist_re_extraction()
+            result_batch = await delta_engine.apply_batch(batch)
+
+        # Record re-extraction event in activity ledger
+        import uuid as _uuid
+        await self.storage.add_activity(
+            _uuid.UUID(context_id) if len(context_id) >= 32 else _uuid.uuid4(),
+            Activity(
+                agent_id="engram-system",
+                action_type=ActionType.RE_EXTRACTION_RAN,
+                summary=(
+                    f"Re-extracted with {request.reflector_model}: "
+                    f"{len(activities)} activities processed, "
+                    f"{len(all_operations)} delta operations"
+                ),
+                delta_batch_id=result_batch.id,
+                extraction_model=request.reflector_model,
+            ),
+        )
 
         # Emit event
         if self.event_bus is not None:

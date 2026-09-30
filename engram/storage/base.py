@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import abc
-from contextlib import asynccontextmanager
 import uuid
 from datetime import datetime
 from typing import Any
@@ -34,18 +33,6 @@ class StorageBackend(abc.ABC):
     @abc.abstractmethod
     async def close(self) -> None:
         """Release connections and resources."""
-
-    @asynccontextmanager
-    async def transaction(self, context_id: str):
-        """Yield a task-owned backend for one atomic context mutation."""
-        raise NotImplementedError(f"{type(self).__name__} does not support transactions")
-        yield  # pragma: no cover
-
-    async def update_bullet_embedding_if_missing(
-        self, context_id: str, bullet_id: str, content: str, embedding: list[float],
-    ) -> bool:
-        """Repair only a missing vector, retaining content, metadata and timestamps."""
-        raise NotImplementedError(f"{type(self).__name__} does not support embedding repair")
 
     # ── Context CRUD ───────────────────────────────────────────────────
 
@@ -147,10 +134,6 @@ class StorageBackend(abc.ABC):
     @abc.abstractmethod
     async def update_schema(self, schema: SchemaNode) -> SchemaNode:
         """Update an existing schema."""
-
-    async def remove_schema(self, context_id: str, schema_id: str) -> bool:
-        """Remove a schema and clear its bullet links within the given context."""
-        raise NotImplementedError(f"{type(self).__name__} does not support schema removal")
 
     # ── Delta History (v0.2) ───────────────────────────────────────────
 

@@ -206,14 +206,13 @@ async def test_validity_gate_passes_model_override(storage, context_id):
     llm = ModelTrackingLLM([_reflection_response(insights), verdicts])
     cfg = IngestionConfig(
         enable_validity_gate=True,
-        reflector_model="reflector-model-abc",
         validity_gate_model="judge-model-xyz",
     )
     engine = IngestionEngine(storage, llm, ingestion_config=cfg)
     await engine.commit(context_id=context_id, agent_id="t", content="raw")
 
-    # Each stage must use its own configured model, independent of adapter defaults.
-    assert llm.models_seen == ["reflector-model-abc", "judge-model-xyz"]
+    # First call is the Reflector (no override → None); second is the judge.
+    assert llm.models_seen == [None, "judge-model-xyz"]
 
 
 # ── 5. Non-ADD ops pass through unchanged ────────────────────────────────────

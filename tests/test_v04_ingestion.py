@@ -363,7 +363,6 @@ class TestReExtractionLowValueRemoval:
         # Create a low-value bullet
         low_value_bullet = Bullet(
             content="Some unimportant note from old extraction",
-            embedding=[1.0, 0.0],
             section="notes",
             bullet_type=BulletType.FACT,
             salience=0.1,
@@ -373,7 +372,6 @@ class TestReExtractionLowValueRemoval:
         )
         low_value_bullet = await storage.add_bullet(ctx_id, low_value_bullet)
 
-        mock_llm.embed = AsyncMock(return_value=[0.0, 1.0])
         curator = CuratorEngine(storage, mock_llm)
         new_reflection = Reflection(
             new_insights=[

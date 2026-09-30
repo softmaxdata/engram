@@ -10,12 +10,10 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 
-from fastapi import APIRouter, Body, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from fastapi.exceptions import RequestValidationError
-from pydantic import ValidationError
 
 from engram.core.config import IngestionConfig
 from engram.core.exceptions import CapacityExceededError
@@ -68,26 +66,24 @@ async def restore_bullet(context_id: str, bullet_id: str, request: Request) -> d
     """Restore an archived bullet to active state."""
     storage = request.app.state.storage
 
-    # Serialize capacity and restore with other context mutations across workers.
-    async with storage.transaction(context_id) as tx:
-        # Check capacity before restoring
-        ctx = await tx.get_context(uuid.UUID(context_id))
-        if ctx is not None:
-            capacity = await tx.get_capacity_status(
-                context_id, ctx.lifecycle_config.max_active_bullets
-            )
-            if capacity.pressure_level == "full":
-                raise HTTPException(
-                    status_code=409,
-                    detail="Cannot restore: context at capacity",
-                )
-
-        bullet = await tx.restore_bullet(context_id, bullet_id)
-        if bullet is None:
+    # Check capacity before restoring
+    ctx = await storage.get_context(uuid.UUID(context_id))
+    if ctx is not None:
+        capacity = await storage.get_capacity_status(
+            context_id, ctx.lifecycle_config.max_active_bullets
+        )
+        if capacity.pressure_level == "full":
             raise HTTPException(
-                status_code=404,
-                detail=f"Bullet {bullet_id} not found or not in archived state",
+                status_code=409,
+                detail="Cannot restore: context at capacity",
             )
+
+    bullet = await storage.restore_bullet(context_id, bullet_id)
+    if bullet is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Bullet {bullet_id} not found or not in archived state",
+        )
     return {"restored": True, "bullet_id": bullet_id}
 
 
@@ -166,9 +162,6 @@ async def sync_context(
     if since:
         try:
             since_dt = datetime.fromisoformat(since)
-            # Legacy clients send naive ISO timestamps; interpret those as UTC.
-            if since_dt.tzinfo is None:
-                since_dt = since_dt.replace(tzinfo=timezone.utc)
             batches = [b for b in batches if b.timestamp > since_dt]
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid 'since' timestamp")
@@ -220,21 +213,19 @@ async def get_ingestion_config(request: Request) -> dict:
 
 
 @config_router.put("/config/ingestion")
-async def update_ingestion_config(request: Request, body: dict = Body(...)) -> dict:
+async def update_ingestion_config(request: Request) -> dict:
     """Update server-level ingestion configuration.
 
     Note: changes only affect NEW commits. Existing bullets are NOT
     retroactively re-extracted. Use the re-extract endpoint for that.
     """
+    body = await request.json()
     current = getattr(request.app.state, "ingestion_config", IngestionConfig())
 
     # Merge: only update fields that are present in the request body
     updated_data = current.model_dump()
     updated_data.update(body)
-    try:
-        new_config = IngestionConfig(**updated_data)
-    except ValidationError as exc:
-        raise RequestValidationError(exc.errors(), body=body) from exc
+    new_config = IngestionConfig(**updated_data)
 
     # Store updated config on app state
     request.app.state.ingestion_config = new_config
@@ -245,15 +236,6 @@ async def update_ingestion_config(request: Request, body: dict = Body(...)) -> d
         ingestion.ingestion_config = new_config
         if hasattr(ingestion, "reflector") and ingestion.reflector is not None:
             ingestion.reflector.config = new_config
-        if getattr(ingestion, "curator", None) is not None:
-            ingestion.curator.ingestion_config = new_config
-
-    re_extraction = getattr(request.app.state, "re_extraction", None)
-    if re_extraction is not None:
-        if getattr(re_extraction, "reflector", None) is not None:
-            re_extraction.reflector.config = new_config
-        if getattr(re_extraction, "curator", None) is not None:
-            re_extraction.curator.ingestion_config = new_config
 
     return {
         "updated": True,

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import abc
-import inspect
 import json
 import logging
 from typing import Any
@@ -36,21 +35,6 @@ class LLMAdapter(abc.ABC):
     @abc.abstractmethod
     async def embed(self, text: str) -> list[float]:
         """Generate an embedding vector for the given text."""
-
-
-async def complete_with_model(llm: LLMAdapter, *, model: str, **kwargs: Any) -> str:
-    """Use per-call routing when supported, retaining pre-model custom adapters.
-
-    Older third-party adapters remain responsible for their own model choice.
-    Inspect before calling so a provider's TypeError is never mistaken for an
-    unsupported argument and retried as a second billable completion.
-    """
-    parameters = inspect.signature(llm.complete).parameters
-    if "model" in parameters or any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
-    ):
-        kwargs["model"] = model
-    return await llm.complete(**kwargs)
 
 
 class LiteLLMAdapter(LLMAdapter):

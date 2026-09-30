@@ -32,7 +32,7 @@ class ConceptGraph:
 
         for cid in concept_ids:
             concept = await self.storage.get_concept(cid)
-            if concept is None or not concept.is_valid or concept.context_id != context_id:
+            if concept is None or not concept.is_valid:
                 continue
             concept.is_valid = False
             concept.invalidated_at = now
@@ -70,9 +70,8 @@ class ConceptGraph:
                     continue
                 visited.add(nid)
                 concept = await self.storage.get_concept(nid)
-                if concept is None or not concept.is_valid or concept.context_id != context_id:
-                    continue
-                result.append(concept)
+                if concept and concept.is_valid:
+                    result.append(concept)
                 edges = await self.storage.get_edges(context_id, node_id=nid)
                 for edge in edges:
                     next_frontier.add(edge.from_node)

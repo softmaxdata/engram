@@ -18,20 +18,6 @@ class ClaudeRenderer(ContextRenderer):
         worked_examples: list[dict] | None = None,
         usage_stats: dict[str, str] | None = None,
     ) -> str:
-        return self.render_with_selection(
-            concepts, intent, token_budget,
-            core_memory=core_memory, worked_examples=worked_examples, usage_stats=usage_stats,
-        )[0]
-
-    def _render_full(
-        self,
-        concepts: list[ConceptNode],
-        intent: IntentAnchor | None,
-        token_budget: int,
-        core_memory: str = "",
-        worked_examples: list[dict] | None = None,
-        usage_stats: dict[str, str] | None = None,
-    ) -> str:
         sections: list[str] = ["<context>"]
 
         if core_memory:
@@ -77,6 +63,8 @@ class ClaudeRenderer(ContextRenderer):
             }
         ]
 
+        current_tokens = self.estimate_tokens("\n".join(sections))
+
         for section_name, section_concepts in [
             ("key_decisions", decisions),
             ("relevant_facts", facts),
@@ -90,7 +78,19 @@ class ClaudeRenderer(ContextRenderer):
             if not section_concepts:
                 continue
             block = self._render_section(section_name, section_concepts, usage_stats)
+            block_tokens = self.estimate_tokens(block)
+            if current_tokens + block_tokens > token_budget:
+                # Trim section to fit budget
+                block = self._render_section_trimmed(
+                    section_name,
+                    section_concepts,
+                    token_budget - current_tokens - 20,
+                )
+                if block:
+                    sections.append(block)
+                break
             sections.append(block)
+            current_tokens += block_tokens
 
         if worked_examples:
             sections.append("  <worked_examples>")
@@ -114,7 +114,7 @@ class ClaudeRenderer(ContextRenderer):
 
     def estimate_tokens(self, text: str) -> int:
         """Approximate token count: ~4 characters per token for Claude."""
-        return len(text) // 4 + 1 if text else 0
+        return len(text) // 4 + 1
 
     def _render_section(
         self, name: str, concepts: list[ConceptNode],
@@ -124,7 +124,24 @@ class ClaudeRenderer(ContextRenderer):
         for c in concepts:
             confidence = f' confidence="{c.confidence:.1f}"' if c.confidence < 1.0 else ""
             tags = f' tags="{",".join(c.domain_tags)}"' if c.domain_tags else ""
-            suffix = self._usage_suffix(c, usage_stats)
+            suffix = f" {usage_stats[c.content]}" if usage_stats and c.content in usage_stats else ""
             lines.append(f"    <concept{confidence}{tags}>{c.content}{suffix}</concept>")
         lines.append(f"  </{name}>")
         return "\n".join(lines)
+
+    def _render_section_trimmed(
+        self, name: str, concepts: list[ConceptNode], budget_tokens: int
+    ) -> str | None:
+        if budget_tokens <= 0:
+            return None
+        lines = [f"  <{name}>"]
+        current = self.estimate_tokens(lines[0])
+        for c in concepts:
+            line = f"    <concept>{c.content}</concept>"
+            line_tokens = self.estimate_tokens(line)
+            if current + line_tokens > budget_tokens:
+                break
+            lines.append(line)
+            current += line_tokens
+        lines.append(f"  </{name}>")
+        return "\n".join(lines) if len(lines) > 2 else None

@@ -266,7 +266,6 @@ class DeltaOperation(BaseModel):
     section: str | None = None
     content: str | None = None
     bullet_type: str | None = None
-    embedding: list[float] | None = None
     reasoning: str = ""
     source: DeltaSource = DeltaSource.CURATOR
     confidence: float = 0.5
@@ -467,7 +466,6 @@ class ConceptNode(BaseModel):
     """
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4)
-    context_id: uuid.UUID | None = None
     type: ConceptType
     content: str = Field(description="Concise natural language, 1-3 sentences max")
     embedding: list[float] | None = Field(default=None)
